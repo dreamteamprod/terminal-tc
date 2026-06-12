@@ -27,7 +27,7 @@ import os
 from enum import IntEnum
 from typing import Optional
 
-from config import AppConfig, SUPPORTED_FPS, load_config, validate_config
+from .config import AppConfig, SUPPORTED_FPS, load_config, validate_config
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 try:
@@ -808,7 +808,7 @@ def main() -> None:
         return
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
-    from tui_app import TimecodeApp
+    from .tui_app import TimecodeApp
 
     markers = build_markers_from_track(initial_track, config.fps)
 

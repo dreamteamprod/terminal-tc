@@ -36,7 +36,7 @@ from textual.widgets import (
 )
 from textual.widget import Widget
 
-from config import (
+from .config import (
     AppConfig,
     TrackConfig,
     save_config,
@@ -44,7 +44,7 @@ from config import (
 )
 
 if TYPE_CHECKING:
-    from artnet_timecode import ArtNetTimecodePlayer
+    from .artnet_timecode import ArtNetTimecodePlayer
 
 _BLOCKS = " ▁▂▃▄▅▆▇█"
 
@@ -818,7 +818,7 @@ class TimecodeApp(App[None]):
         if idx == self._active_idx:
             return
 
-        from artnet_timecode import build_player_from_track, build_markers_from_track
+        from .artnet_timecode import build_player_from_track, build_markers_from_track
 
         old_player = self._player
         old_player.stop()
@@ -919,7 +919,7 @@ class TimecodeApp(App[None]):
         self._active_idx = min(self._active_idx, max(0, len(self._tracks) - 1))
         save_config(self._update_config_tracks())
 
-        from artnet_timecode import build_player_from_track, build_markers_from_track
+        from .artnet_timecode import build_player_from_track, build_markers_from_track
 
         self._player = build_player_from_track(
             self._tracks[self._active_idx], new_config
@@ -1533,7 +1533,7 @@ class SettingsScreen(ModalScreen):
             return
 
         fps_errs = []
-        from config import SUPPORTED_FPS
+        from .config import SUPPORTED_FPS
 
         if cfg.fps not in SUPPORTED_FPS:
             fps_errs.append(f"Frame rate must be one of {SUPPORTED_FPS}")
