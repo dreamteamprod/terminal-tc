@@ -1,4 +1,4 @@
-rich>=13.0
+textual>=0.47
 sounddevice>=0.4
 soundfile>=0.12
 numpy>=1.24
