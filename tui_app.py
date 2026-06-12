@@ -36,7 +36,12 @@ from textual.widgets import (
 )
 from textual.widget import Widget
 
-from config import AppConfig, TrackConfig, save_config, validate_config, validate_track_config
+from config import (
+    AppConfig,
+    TrackConfig,
+    save_config,
+    validate_track_config,
+)
 
 if TYPE_CHECKING:
     from artnet_timecode import ArtNetTimecodePlayer
@@ -282,7 +287,9 @@ class WaveformWidget(Widget):
             ):
                 s0 = int(self._view_start * self._total_samples)
                 s1 = max(s0 + 1, int(self._view_end * self._total_samples))
-                raw = np.abs(self._player._audio_data[s0:s1].mean(axis=1)).astype(np.float32)
+                raw = np.abs(self._player._audio_data[s0:s1].mean(axis=1)).astype(
+                    np.float32
+                )
                 g_peak = getattr(self, "_global_peak", 0.0) or float(raw.max())
                 slice_env = raw / g_peak if g_peak > 0 else raw
             else:
@@ -392,7 +399,9 @@ class WaveformWidget(Widget):
         vs, ve = self._view_start, self._view_end
         center = (vs + ve) / 2
         span = ve - vs
-        new_span = span / self._ZOOM_FACTOR if direction > 0 else span * self._ZOOM_FACTOR
+        new_span = (
+            span / self._ZOOM_FACTOR if direction > 0 else span * self._ZOOM_FACTOR
+        )
         n = len(self._envelope) if self._envelope is not None else 8000
         min_span = max(8.0 / n, 4.0 / max(1, self.size.width))
         new_span = max(min_span, min(1.0, new_span))
@@ -451,6 +460,7 @@ class TrackList(Widget):
 
     class Activated(Message):
         """Posted when the user activates a track row."""
+
         def __init__(self, idx: int) -> None:
             super().__init__()
             self.idx = idx
@@ -555,7 +565,11 @@ class TimecodeCommands(Provider):
         ("Add Track", "Add a new track to the session", "action_add_track"),
         ("Edit Track", "Edit the selected track", "action_edit_track"),
         ("Delete Track", "Delete the selected track", "action_delete_track"),
-        ("Export Markers to CSV", "Save current markers to a CSV file", "action_export_markers"),
+        (
+            "Export Markers to CSV",
+            "Save current markers to a CSV file",
+            "action_export_markers",
+        ),
         ("Settings", "Configure network and timecode", "action_open_settings"),
         ("Quit", "Exit the application", "action_quit"),
     ]
@@ -818,7 +832,9 @@ class TimecodeApp(App[None]):
         self._last_wave_col = -1
 
         try:
-            self.query_one("#waveform", WaveformWidget).reload(self._player, self._markers)
+            self.query_one("#waveform", WaveformWidget).reload(
+                self._player, self._markers
+            )
             self.query_one("#markers", MarkerList).set_markers(self._markers)
             self.query_one("#info", Static).update(self._info_text())
             marker_panel = self.query_one("#marker-panel")
@@ -846,7 +862,9 @@ class TimecodeApp(App[None]):
             return
         self._tracks.append(new_track)
         save_config(self._update_config_tracks())
-        self.query_one("#track-list", TrackList).set_tracks(self._tracks, self._active_idx)
+        self.query_one("#track-list", TrackList).set_tracks(
+            self._tracks, self._active_idx
+        )
 
     @work
     async def action_edit_track(self) -> None:
@@ -903,20 +921,27 @@ class TimecodeApp(App[None]):
 
         from artnet_timecode import build_player_from_track, build_markers_from_track
 
-        self._player = build_player_from_track(self._tracks[self._active_idx], new_config)
-        self._markers = build_markers_from_track(self._tracks[self._active_idx], new_config.fps)
+        self._player = build_player_from_track(
+            self._tracks[self._active_idx], new_config
+        )
+        self._markers = build_markers_from_track(
+            self._tracks[self._active_idx], new_config.fps
+        )
         self._last_frame = -1
         self._last_wave_col = -1
         await self.recompose()
         if self._markers:
             self.query_one("#marker-panel").add_class("visible")
-        self.query_one("#track-list", TrackList).set_tracks(self._tracks, self._active_idx)
+        self.query_one("#track-list", TrackList).set_tracks(
+            self._tracks, self._active_idx
+        )
 
     # ── Transport ─────────────────────────────────────────────────────────────
 
     def action_toggle_waveform(self) -> None:
         wf = self.query_one("#waveform", WaveformWidget)
         wf.display = not wf.display
+        self.refresh_bindings()
 
     def action_zoom_in(self) -> None:
         self.query_one("#waveform", WaveformWidget)._zoom(+1)
@@ -947,19 +972,25 @@ class TimecodeApp(App[None]):
 
     def _set_nav_mode(self, mode: str) -> None:
         self._nav_mode = mode
-        self.query_one("#track-list", TrackList).set_class(mode == "tracks", "nav-active")
+        self.query_one("#track-list", TrackList).set_class(
+            mode == "tracks", "nav-active"
+        )
         self.query_one("#marker-panel").set_class(mode == "markers", "nav-active")
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("toggle_waveform", "scrub_fwd", "scrub_back"):
+            return self._nav_mode == ""
         if action in ("zoom_in", "zoom_out", "pan_left", "pan_right", "reset_zoom"):
+            if self._nav_mode != "":
+                return False
             try:
                 wf = self.query_one("#waveform", WaveformWidget)
                 return bool(wf.display and wf._envelope is not None)
             except NoMatches:
                 return False
         if action in ("add_track", "edit_track", "delete_track"):
-            return True if self._nav_mode == "tracks" else False
+            return self._nav_mode == "tracks"
         if action in ("prev_marker", "next_marker", "jump_marker"):
             return self._nav_mode in ("tracks", "markers")
         if action == "export_markers":
@@ -1000,8 +1031,10 @@ class TimecodeApp(App[None]):
             return
         track = self._active_track()
         base = os.path.splitext(track.markers or "")[0] if track else ""
-        default_path = (base + "_export.csv") if base else os.path.join(
-            os.path.expanduser("~"), "markers_export.csv"
+        default_path = (
+            (base + "_export.csv")
+            if base
+            else os.path.join(os.path.expanduser("~"), "markers_export.csv")
         )
 
         def on_path(path: str | None) -> None:
@@ -1106,10 +1139,14 @@ class TrackEditModal(ModalScreen):
                 yield Input(value=str(t.start_hours), id="inp-hours", type="integer")
             with Horizontal(classes="field-row"):
                 yield Label("Start Minutes (0–59)", classes="field-label")
-                yield Input(value=str(t.start_minutes), id="inp-minutes", type="integer")
+                yield Input(
+                    value=str(t.start_minutes), id="inp-minutes", type="integer"
+                )
             with Horizontal(classes="field-row"):
                 yield Label("Start Seconds (0–59)", classes="field-label")
-                yield Input(value=str(t.start_seconds), id="inp-seconds", type="integer")
+                yield Input(
+                    value=str(t.start_seconds), id="inp-seconds", type="integer"
+                )
             with Horizontal(classes="field-row"):
                 yield Label("Start Frames", classes="field-label")
                 yield Input(value=str(t.start_frames), id="inp-frames", type="integer")
@@ -1166,7 +1203,9 @@ class TrackEditModal(ModalScreen):
             start = self.query_one("#inp-audio", Input).value or os.path.expanduser("~")
             self.app.push_screen(FileBrowserModal(start), self._on_audio_chosen)
         elif btn == "btn-markers-browse":
-            start = self.query_one("#inp-markers", Input).value or os.path.expanduser("~")
+            start = self.query_one("#inp-markers", Input).value or os.path.expanduser(
+                "~"
+            )
             self.app.push_screen(FileBrowserModal(start), self._on_markers_chosen)
 
     def _on_audio_chosen(self, path: str | None) -> None:
@@ -1467,7 +1506,9 @@ class SettingsScreen(ModalScreen):
 
     def _delete_track(self) -> None:
         if len(self._working_tracks) <= 1:
-            self.query_one("#validation-error", Static).update("Cannot delete the last track")
+            self.query_one("#validation-error", Static).update(
+                "Cannot delete the last track"
+            )
             self.query_one("#validation-error", Static).add_class("visible")
             return
         tl = self.query_one("#settings-track-list", TrackList)
@@ -1493,6 +1534,7 @@ class SettingsScreen(ModalScreen):
 
         fps_errs = []
         from config import SUPPORTED_FPS
+
         if cfg.fps not in SUPPORTED_FPS:
             fps_errs.append(f"Frame rate must be one of {SUPPORTED_FPS}")
         if fps_errs:

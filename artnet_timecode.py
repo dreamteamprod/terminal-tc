@@ -37,6 +37,7 @@ except ImportError:
 
 try:
     import numpy as np
+
     _NP_AVAILABLE = True
 except ImportError:
     _NP_AVAILABLE = False
@@ -44,12 +45,14 @@ except ImportError:
 try:
     import sounddevice as sd
     import soundfile as sf
+
     AUDIO_AVAILABLE = _NP_AVAILABLE
 except ImportError:
     AUDIO_AVAILABLE = False
 except OSError:
     # PortAudio not installed (common on WSL/headless Linux)
     AUDIO_AVAILABLE = False
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _is_wsl() -> bool:
@@ -63,11 +66,10 @@ def _is_wsl() -> bool:
 def _wsl_audio_hint() -> str:
     """Return a fix hint when no audio output devices are found on WSL."""
     import glob
+
     plugin = glob.glob("/usr/lib/*/alsa-lib/libasound_module_pcm_pulse.so")
     if not plugin:
-        return (
-            "No audio devices on WSL — fix: sudo apt install libasound2-plugins"
-        )
+        return "No audio devices on WSL — fix: sudo apt install libasound2-plugins"
     return "No audio devices — ALSA pulse plugin present but PortAudio sees no outputs"
 
 
@@ -313,14 +315,18 @@ class ArtNetTimecodePlayer:
                     "pip install sounddevice soundfile"
                 )
             else:
-                self._audio_error = "Audio unavailable — pip install sounddevice soundfile"
+                self._audio_error = (
+                    "Audio unavailable — pip install sounddevice soundfile"
+                )
             return
         try:
             has_output = any(d["max_output_channels"] > 0 for d in sd.query_devices())
         except Exception:
             has_output = True  # can't check; proceed and let playback fail naturally
         if not has_output:
-            self._audio_error = _wsl_audio_hint() if _is_wsl() else "No audio output devices found"
+            self._audio_error = (
+                _wsl_audio_hint() if _is_wsl() else "No audio output devices found"
+            )
             return
         if not os.path.isfile(path):
             self._audio_error = f"File not found: {path}"
@@ -762,7 +768,15 @@ def main() -> None:
         config.markers = None
 
     # If CLI supplied track-related flags, sync them into tracks[0] so they win
-    _track_cli_keys = {"audio", "markers", "marker_format", "start_hours", "start_minutes", "start_seconds", "start_frames"}
+    _track_cli_keys = {
+        "audio",
+        "markers",
+        "marker_format",
+        "start_hours",
+        "start_minutes",
+        "start_seconds",
+        "start_frames",
+    }
     if _track_cli_keys & cli_dict.keys():
         t0 = config.tracks[0]
         if "audio" in cli_dict:
