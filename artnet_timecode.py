@@ -336,6 +336,47 @@ class ArtNetTimecodePlayer:
         else:
             self.play()
 
+    def _emit_tc_at_acc(self) -> None:
+        """Update _tc and send one Art-Net packet at the current _pause_frame_acc."""
+        abs_frame = self.start_tc.frame_number + self._pause_frame_acc
+        tc = tc_from_frame_number(self.fps, abs_frame)
+        with self._tc_lock:
+            self._tc = tc
+        try:
+            pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
+            self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
+            self.packet_count += 1
+        except Exception:
+            self.error_count += 1
+
+    def scrub(self, delta_seconds: float) -> None:
+        """Shift playback position by delta_seconds (negative = backward). Default step: 5s."""
+        delta_frames = round(delta_seconds * self.fps)
+
+        if self.state == State.PLAYING:
+            # Capture thread handles before pause() so we can join them.
+            # pause() sets _stop_event; joining ensures play()'s _stop_event.clear()
+            # doesn't race with old threads that haven't exited yet.
+            old_ticker = self._ticker_thread
+            old_audio  = self._audio_thread_hdl
+            self.pause()
+            if old_ticker is not None:
+                old_ticker.join(timeout=0.2)
+            if old_audio is not None:
+                old_audio.join(timeout=0.2)
+            self._pause_frame_acc = max(0, self._pause_frame_acc + delta_frames)
+            self.play()
+
+        elif self.state == State.PAUSED:
+            self._pause_frame_acc = max(0, self._pause_frame_acc + delta_frames)
+            self._emit_tc_at_acc()
+
+        else:  # STOPPED → transition to PAUSED at scrubbed position
+            self._pause_frame_acc = max(0, delta_frames)
+            self.state      = State.PAUSED
+            self.status_msg = "Paused"
+            self._emit_tc_at_acc()
+
     def get_tc(self) -> _LibTimecode:
         with self._tc_lock:
             return self._tc
@@ -349,7 +390,10 @@ class ArtNetTimecodePlayer:
 
     def shutdown(self) -> None:
         self._stop_event.set()
-        self._stop_audio()
+        if self._ticker_thread is not None:
+            self._ticker_thread.join(timeout=0.5)
+        if self._audio_thread_hdl is not None:
+            self._audio_thread_hdl.join(timeout=1.0)
         try:
             self._sock.close()
         except Exception:
@@ -487,9 +531,10 @@ class DirectTUI:
         ctrl = (
             _rev(_bold(" SPACE ")) + _dim("  Play / Pause    ") +
             _rev(_bold("  S  ")) + _dim("  Stop    ") +
+            _rev(_bold("  ◀  ▶  ")) + _dim("  Scrub ±5s    ") +
             _rev(_bold("  Q  ")) + _dim("  Quit")
         )
-        ctrl_vis = len("  SPACE   Play / Pause      S   Stop      Q   Quit")
+        ctrl_vis = len("  SPACE   Play / Pause      S   Stop      ◀  ▶   Scrub ±5s      Q   Quit")
 
         self._w(_hide_cursor())
         self._w(_goto(self._row(_REL_BORDER_TOP), 1))
@@ -619,9 +664,14 @@ def _make_key_reader():
     """Return a platform-appropriate non-blocking key-read function."""
     if sys.platform == "win32":
         import msvcrt
+        _WIN_ARROW = {"K": "\x1b[D", "M": "\x1b[C", "H": "\x1b[A", "P": "\x1b[B"}
         def read_key() -> Optional[str]:
             if msvcrt.kbhit():
-                return msvcrt.getwch()
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    ch2 = msvcrt.getwch()   # always drain second byte
+                    return _WIN_ARROW.get(ch2)  # None for unmapped specials
+                return ch
             time.sleep(0.04)
             return None
     else:
@@ -633,7 +683,19 @@ def _make_key_reader():
             try:
                 tty.setraw(fd)
                 if select.select([sys.stdin], [], [], 0.04)[0]:
-                    return sys.stdin.read(1)
+                    # Use os.read to bypass Python's BufferedReader, which would
+                    # consume all 3 bytes of an arrow sequence on the first call,
+                    # leaving subsequent select() checks seeing an empty fd.
+                    ch = os.read(fd, 1).decode('latin-1')
+                    if ch == "\x1b":
+                        # Check for CSI escape sequence (arrow keys send \x1b[A/B/C/D)
+                        if select.select([sys.stdin], [], [], 0.005)[0]:
+                            ch2 = os.read(fd, 1).decode('latin-1')
+                            if ch2 == "[" and select.select([sys.stdin], [], [], 0.005)[0]:
+                                ch3 = os.read(fd, 1).decode('latin-1')
+                                return "\x1b[" + ch3   # e.g. "\x1b[C" (right), "\x1b[D" (left)
+                        return "\x1b"   # bare Escape or Alt+letter → treated as quit
+                    return ch
                 return None
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -775,6 +837,10 @@ def main() -> None:
                         player.toggle_play_pause()
                     elif k == "s":
                         player.stop()
+                    elif k == "\x1b[c":   # right arrow → +5s
+                        player.scrub(+5.0)
+                    elif k == "\x1b[d":   # left arrow  → −5s
+                        player.scrub(-5.0)
                     elif k in ("q", "\x03", "\x1b"):   # q / Ctrl-C / Esc
                         break
                 tui.refresh()
