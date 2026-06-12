@@ -643,13 +643,46 @@ def build_markers(cfg: AppConfig) -> list:
     return load_markers(cfg.markers, cfg.fps, fmt=cfg.marker_format)
 
 
+def build_player_from_track(track, cfg: AppConfig) -> "ArtNetTimecodePlayer":
+    """Construct a player for a TrackConfig using global network/FPS settings."""
+    start_tc = make_tc(
+        fps=cfg.fps,
+        hours=track.start_hours,
+        minutes=track.start_minutes,
+        seconds=track.start_seconds,
+        frames=track.start_frames,
+    )
+    return ArtNetTimecodePlayer(
+        start_tc=start_tc,
+        fps=cfg.fps,
+        dest_ip=cfg.ip,
+        dest_port=cfg.port,
+        audio_path=track.audio,
+        broadcast=cfg.broadcast,
+    )
+
+
+def build_markers_from_track(track, fps: float) -> list:
+    """Load marker file for a TrackConfig, or return [] if none configured."""
+    if not track.markers:
+        return []
+    return load_markers(track.markers, fps, fmt=track.marker_format)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
-    # Three-layer merge: defaults → saved JSON → explicit CLI flags
+    # Three-layer merge: defaults → saved JSON → explicit CLI flags.
+    # Tracks are handled separately: load_config() returns proper TrackConfig
+    # objects; asdict() would flatten them back to dicts and lose the type.
     cli_dict = vars(parse_args())
+    saved_config = load_config()  # already has TrackConfig objects + migration applied
     defaults_dict = dataclasses.asdict(AppConfig())
-    saved_dict = dataclasses.asdict(load_config())
-    config = AppConfig(**{**defaults_dict, **saved_dict, **cli_dict})
+    saved_flat = dataclasses.asdict(saved_config)
+    saved_flat.pop("tracks", None)
+    defaults_dict.pop("tracks", None)
+    cli_dict.pop("tracks", None)
+    config = AppConfig(**{**defaults_dict, **saved_flat, **cli_dict})
+    config.tracks = saved_config.tracks  # preserve the properly-typed TrackConfig list
 
     # Auto-enable broadcast for .255 addresses
     if config.ip.endswith(".255"):
@@ -676,7 +709,22 @@ def main() -> None:
     if config.markers and not os.path.isfile(config.markers):
         config.markers = None
 
-    player = build_player(config)
+    # If CLI supplied track-related flags, sync them into tracks[0] so they win
+    _track_cli_keys = {"audio", "markers", "marker_format", "start_hours", "start_minutes", "start_seconds", "start_frames"}
+    if _track_cli_keys & cli_dict.keys():
+        t0 = config.tracks[0]
+        if "audio" in cli_dict:
+            t0.audio = config.audio
+        if "markers" in cli_dict:
+            t0.markers = config.markers
+        if "marker_format" in cli_dict:
+            t0.marker_format = config.marker_format
+        for k in ("start_hours", "start_minutes", "start_seconds", "start_frames"):
+            if k in cli_dict:
+                setattr(t0, k, getattr(config, k))
+
+    initial_track = config.tracks[0]
+    player = build_player_from_track(initial_track, config)
 
     # ── Non-interactive fallback (piped stdin / CI) ────────────────────────────
     if not _is_interactive():
@@ -693,12 +741,12 @@ def main() -> None:
             player.shutdown()
         return
 
-    markers = build_markers(config)
-
     # ── Interactive TUI ────────────────────────────────────────────────────────
     from tui_app import TimecodeApp
 
-    TimecodeApp(config, player, markers=markers).run()
+    markers = build_markers_from_track(initial_track, config.fps)
+
+    TimecodeApp(config, player, markers=markers, tracks=config.tracks).run()
     print(f"\nStopped. {player.packet_count:,} Art-Net packets sent.\n")
 
 

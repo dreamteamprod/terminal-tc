@@ -53,11 +53,24 @@ def get_default_broadcast() -> str:
 
 
 @dataclasses.dataclass
+class TrackConfig:
+    name: str = "Track 1"
+    audio: Optional[str] = None
+    markers: Optional[str] = None
+    marker_format: str = "auto"
+    start_hours: int = 0
+    start_minutes: int = 0
+    start_seconds: int = 0
+    start_frames: int = 0
+
+
+@dataclasses.dataclass
 class AppConfig:
     ip: str = dataclasses.field(default_factory=get_default_broadcast)
     port: int = 6454
     broadcast: bool = False
     fps: float = 25.0
+    # Kept for CLI backwards compat — single-track path in main()
     start_hours: int = 0
     start_minutes: int = 0
     start_seconds: int = 0
@@ -65,6 +78,7 @@ class AppConfig:
     audio: Optional[str] = None
     markers: Optional[str] = None
     marker_format: str = "auto"
+    tracks: list = dataclasses.field(default_factory=list)  # list[TrackConfig]
 
 
 def load_config() -> AppConfig:
@@ -72,14 +86,41 @@ def load_config() -> AppConfig:
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        known = {field.name for field in dataclasses.fields(AppConfig)}
-        filtered = {k: v for k, v in data.items() if k in known}
-        # Ensure fps is always float regardless of how JSON serialised it
+        known_app = {field.name for field in dataclasses.fields(AppConfig)}
+        known_track = {field.name for field in dataclasses.fields(TrackConfig)}
+        filtered = {k: v for k, v in data.items() if k in known_app}
         if "fps" in filtered:
             filtered["fps"] = float(filtered["fps"])
-        return AppConfig(**filtered)
+
+        # dataclasses.asdict() serialises TrackConfig as plain dicts — re-inflate manually
+        raw_tracks = filtered.pop("tracks", [])
+        tracks = [
+            TrackConfig(**{k: v for k, v in t.items() if k in known_track})
+            for t in raw_tracks
+            if isinstance(t, dict)
+        ]
+
+        cfg = AppConfig(**filtered)
+        cfg.tracks = tracks
     except (OSError, json.JSONDecodeError, TypeError):
-        return AppConfig()
+        cfg = AppConfig()
+
+    # Migrate legacy single-track config (no tracks list) to tracks[0]
+    if not cfg.tracks:
+        cfg.tracks = [
+            TrackConfig(
+                name="Track 1",
+                audio=cfg.audio,
+                markers=cfg.markers,
+                marker_format=cfg.marker_format,
+                start_hours=cfg.start_hours,
+                start_minutes=cfg.start_minutes,
+                start_seconds=cfg.start_seconds,
+                start_frames=cfg.start_frames,
+            )
+        ]
+
+    return cfg
 
 
 def save_config(cfg: AppConfig) -> None:
@@ -92,11 +133,7 @@ def save_config(cfg: AppConfig) -> None:
 
 
 def validate_config(cfg: AppConfig, *, check_files: bool = True) -> list[str]:
-    """Return human-readable error strings; empty list means valid.
-
-    Pass check_files=False to skip file-existence checks (useful at startup
-    where stale saved paths should not be fatal).
-    """
+    """Return human-readable error strings for global (non-track) settings; empty list means valid."""
     errs: list[str] = []
     if cfg.fps not in SUPPORTED_FPS:
         errs.append(f"Frame rate must be one of {SUPPORTED_FPS}")
@@ -114,4 +151,28 @@ def validate_config(cfg: AppConfig, *, check_files: bool = True) -> list[str]:
             errs.append(f"Audio file not found: {cfg.audio}")
         if cfg.markers and not os.path.isfile(cfg.markers):
             errs.append(f"Markers file not found: {cfg.markers}")
+    return errs
+
+
+def validate_track_config(
+    track: TrackConfig, fps: float, *, check_files: bool = True
+) -> list[str]:
+    """Return human-readable error strings for a single track; empty list means valid."""
+    errs: list[str] = []
+    if not track.name.strip():
+        errs.append("Track name cannot be empty")
+    if not (0 <= track.start_hours <= 23):
+        errs.append("Start hours must be 0–23")
+    if not (0 <= track.start_minutes <= 59):
+        errs.append("Start minutes must be 0–59")
+    if not (0 <= track.start_seconds <= 59):
+        errs.append("Start seconds must be 0–59")
+    max_frames = round(fps) - 1
+    if not (0 <= track.start_frames <= max_frames):
+        errs.append(f"Start frames must be 0–{max_frames} for {fps} fps")
+    if check_files:
+        if track.audio and not os.path.isfile(track.audio):
+            errs.append(f"Audio file not found: {track.audio}")
+        if track.markers and not os.path.isfile(track.markers):
+            errs.append(f"Markers file not found: {track.markers}")
     return errs
