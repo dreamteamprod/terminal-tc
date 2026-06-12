@@ -62,6 +62,7 @@ class TrackConfig:
     start_minutes: int = 0
     start_seconds: int = 0
     start_frames: int = 0
+    markers_absolute: bool = True
 
 
 @dataclasses.dataclass

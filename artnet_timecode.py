@@ -666,7 +666,20 @@ def build_markers_from_track(track, fps: float) -> list:
     """Load marker file for a TrackConfig, or return [] if none configured."""
     if not track.markers:
         return []
-    return load_markers(track.markers, fps, fmt=track.marker_format)
+    markers = load_markers(track.markers, fps, fmt=track.marker_format)
+    if not track.markers_absolute:
+        offset = make_tc(
+            fps,
+            track.start_hours,
+            track.start_minutes,
+            track.start_seconds,
+            track.start_frames,
+        ).frame_number
+        markers = [
+            (mid, name, tc_from_frame_number(fps, tc.frame_number + offset))
+            for mid, name, tc in markers
+        ]
+    return markers
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

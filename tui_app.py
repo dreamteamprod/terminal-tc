@@ -4,6 +4,7 @@ Textual TUI for the Art-Net Timecode Player.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import os
 from typing import TYPE_CHECKING
@@ -418,6 +419,7 @@ class TimecodeCommands(Provider):
         ("Add Track", "Add a new track to the session", "action_add_track"),
         ("Edit Track", "Edit the selected track", "action_edit_track"),
         ("Delete Track", "Delete the selected track", "action_delete_track"),
+        ("Export Markers to CSV", "Save current markers to a CSV file", "action_export_markers"),
         ("Settings", "Configure network and timecode", "action_open_settings"),
         ("Quit", "Exit the application", "action_quit"),
     ]
@@ -460,6 +462,7 @@ class TimecodeApp(App[None]):
         Binding("a", "add_track", "Add Track"),
         Binding("e", "edit_track", "Edit Track"),
         Binding("d", "delete_track", "Del Track"),
+        Binding("x", "export_markers", "Export"),
         Binding("ctrl+comma", "open_settings", "Settings"),
         Binding("q", "quit", "Quit", priority=True),
         Binding("escape", "quit", "Quit", show=False),
@@ -786,7 +789,9 @@ class TimecodeApp(App[None]):
         if action in ("add_track", "edit_track", "delete_track"):
             return True if self._nav_mode == "tracks" else False
         if action in ("prev_marker", "next_marker", "jump_marker"):
-            return True if self._nav_mode == "markers" else False
+            return self._nav_mode in ("tracks", "markers")
+        if action == "export_markers":
+            return self._nav_mode == "markers"
         return True
 
     def action_focus_tracks(self) -> None:
@@ -816,6 +821,31 @@ class TimecodeApp(App[None]):
             m = self.query_one("#markers", MarkerList).selected_marker()
             if m:
                 self._player.seek_to_frame(m[2].frame_number)
+
+    async def action_export_markers(self) -> None:
+        if not self._markers:
+            self.notify("No markers loaded", severity="warning")
+            return
+        track = self._active_track()
+        base = os.path.splitext(track.markers or "")[0] if track else ""
+        default_path = (base + "_export.csv") if base else os.path.join(
+            os.path.expanduser("~"), "markers_export.csv"
+        )
+
+        def on_path(path: str | None) -> None:
+            if not path:
+                return
+            try:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["id", "name", "timecode"])
+                    for mid, name, tc in self._markers:
+                        writer.writerow([mid, name, str(tc)])
+                self.notify(f"Exported {len(self._markers)} markers → {path}")
+            except OSError as exc:
+                self.notify(f"Export failed: {exc}", severity="error")
+
+        await self.push_screen(ExportMarkersModal(default_path), on_path)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-play":
@@ -935,6 +965,17 @@ class TrackEditModal(ModalScreen):
                     id="sel-marker-format",
                     allow_blank=False,
                 )
+            with Horizontal(classes="field-row"):
+                yield Label("Marker Mode", classes="field-label")
+                yield Select(
+                    [
+                        ("Absolute (no offset)", "absolute"),
+                        ("Relative (add start TC)", "relative"),
+                    ],
+                    value="absolute" if t.markers_absolute else "relative",
+                    id="sel-markers-absolute",
+                    allow_blank=False,
+                )
             yield Static("", id="validation-error")
             with Horizontal(id="modal-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
@@ -967,6 +1008,7 @@ class TrackEditModal(ModalScreen):
     def _try_save(self) -> None:
         try:
             fmt_raw = self.query_one("#sel-marker-format", Select).value
+            abs_raw = self.query_one("#sel-markers-absolute", Select).value
             track = TrackConfig(
                 name=self.query_one("#inp-name", Input).value.strip(),
                 start_hours=int(self.query_one("#inp-hours", Input).value or "0"),
@@ -976,6 +1018,7 @@ class TrackEditModal(ModalScreen):
                 audio=self.query_one("#inp-audio", Input).value.strip() or None,
                 markers=self.query_one("#inp-markers", Input).value.strip() or None,
                 marker_format=str(fmt_raw) if fmt_raw is not Select.BLANK else "auto",
+                markers_absolute=abs_raw != "relative",
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
@@ -994,13 +1037,90 @@ class TrackEditModal(ModalScreen):
         err.add_class("visible")
 
 
+# ── Export markers modal ───────────────────────────────────────────────────────
+
+
+class ExportMarkersModal(ModalScreen):
+    """Prompt for an output path, then dismiss with that path (or None on cancel)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    ExportMarkersModal {
+        align: center middle;
+    }
+    ExportMarkersModal > Vertical {
+        width: 74;
+        height: auto;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    ExportMarkersModal #modal-title {
+        text-style: bold;
+        height: 2;
+        padding: 0 0 1 0;
+    }
+    ExportMarkersModal .field-row {
+        height: 3;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    ExportMarkersModal .field-label {
+        width: 26;
+        height: 3;
+        content-align: left middle;
+        padding: 1 0;
+    }
+    ExportMarkersModal Input { width: 1fr; }
+    ExportMarkersModal #modal-buttons {
+        height: 3;
+        align: right middle;
+        margin: 1 0 0 0;
+    }
+    ExportMarkersModal #modal-buttons Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def __init__(self, default_path: str) -> None:
+        super().__init__()
+        self._default_path = default_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("↓  Export Markers to CSV", id="modal-title")
+            with Horizontal(classes="field-row"):
+                yield Label("Output File", classes="field-label")
+                yield Input(value=self._default_path, id="inp-export-path")
+            with Horizontal(id="modal-buttons"):
+                yield Button("Export", id="btn-export", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+        elif event.button.id == "btn-export":
+            path = self.query_one("#inp-export-path", Input).value.strip()
+            self.dismiss(path or None)
+
+
 # ── Settings modal ─────────────────────────────────────────────────────────────
 
 
 class SettingsScreen(ModalScreen):
     """Full-screen modal for configuring network, timecode, and tracks."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("up", "track_cursor_up", show=False),
+        Binding("down", "track_cursor_down", show=False),
+        Binding("enter", "track_select", show=False),
+    ]
 
     DEFAULT_CSS = """
     SettingsScreen {
@@ -1124,6 +1244,25 @@ class SettingsScreen(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def _tracks_tab_active(self) -> bool:
+        try:
+            return self.query_one(TabbedContent).active == "tab-tracks"
+        except NoMatches:
+            return False
+
+    def action_track_cursor_up(self) -> None:
+        if self._tracks_tab_active():
+            self.query_one("#settings-track-list", TrackList).move_cursor(-1)
+
+    def action_track_cursor_down(self) -> None:
+        if self._tracks_tab_active():
+            self.query_one("#settings-track-list", TrackList).move_cursor(+1)
+
+    def action_track_select(self) -> None:
+        if self._tracks_tab_active():
+            tl = self.query_one("#settings-track-list", TrackList)
+            self._open_track_edit(tl.cursor)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn = event.button.id
