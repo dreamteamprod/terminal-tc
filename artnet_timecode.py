@@ -123,26 +123,84 @@ def tc_from_frame_number(fps: float, frame_number: int) -> _LibTimecode:
     return _LibTimecode(_FPS_STR[fps], frames=frame_number + 1)
 
 
-def load_markers(path: str, fps: float) -> list:
-    """Load cue markers from a CSV file (columns: #, Name, Start TC).
+def _detect_marker_format(path: str) -> str:
+    """Sniff the first non-empty line to determine marker file format."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    return "reaper"
+                if line.startswith("Track"):
+                    return "cuepoints"
+                return "audacity"
+    except OSError:
+        pass
+    return "reaper"
 
-    Returns a list of (id, name, tc) tuples sorted by ascending timecode.
-    The header row (first field == '#') is skipped. Malformed rows are ignored.
-    """
+
+def _parse_reaper_markers(f, fps: float) -> list:
     import csv
-
     markers = []
+    for row in csv.reader(f):
+        if len(row) < 3 or row[0].strip() == "#":
+            continue
+        mid, name, tc_str = row[0].strip(), row[1].strip(), row[2].strip()
+        try:
+            markers.append((mid, name, _LibTimecode(_FPS_STR[fps], tc_str)))
+        except Exception:
+            pass
+    return markers
+
+
+def _parse_audacity_markers(f, fps: float) -> list:
+    markers = []
+    seq = 1
+    for line in f:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            frame_number = round(float(parts[0]) * fps)
+            tc = tc_from_frame_number(fps, frame_number)
+            markers.append((str(seq), parts[2].strip(), tc))
+            seq += 1
+        except (ValueError, KeyError):
+            pass
+    return markers
+
+
+def _parse_cuepoints_markers(f, fps: float) -> list:
+    import csv
+    markers = []
+    for row in csv.reader(f, delimiter="\t"):
+        if len(row) < 5 or row[0].strip() == "Track":
+            continue
+        mid, tc_str, name = row[3].strip(), row[2].strip(), row[4].strip()
+        try:
+            markers.append((mid, name, _LibTimecode(_FPS_STR[fps], tc_str)))
+        except Exception:
+            pass
+    return markers
+
+
+def load_markers(path: str, fps: float, fmt: str = "auto") -> list:
+    """Load cue markers from a file, returning (id, name, tc) tuples sorted by timecode.
+
+    Supported formats: reaper, audacity, cuepoints (default: auto-detect).
+    """
+    if fmt == "auto":
+        fmt = _detect_marker_format(path)
     try:
         with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.reader(f):
-                if len(row) < 3 or row[0].strip() == "#":
-                    continue
-                mid, name, tc_str = row[0].strip(), row[1].strip(), row[2].strip()
-                try:
-                    tc = _LibTimecode(_FPS_STR[fps], tc_str)
-                    markers.append((mid, name, tc))
-                except Exception:
-                    pass
+            if fmt == "audacity":
+                markers = _parse_audacity_markers(f, fps)
+            elif fmt == "cuepoints":
+                markers = _parse_cuepoints_markers(f, fps)
+            else:
+                markers = _parse_reaper_markers(f, fps)
     except OSError as e:
         sys.exit(f"Cannot open markers file: {e}")
     markers.sort(key=lambda m: m[2].frame_number)
@@ -538,7 +596,14 @@ Examples:
     parser.add_argument(
         "--markers",
         metavar="FILE",
-        help="CSV file of timecode markers (columns: #, Name, Start TC)",
+        help="Marker file (Reaper CSV, Audacity labels, or CuePoints spreadsheet; auto-detected)",
+    )
+    parser.add_argument(
+        "--marker-format",
+        choices=["auto", "reaper", "audacity", "cuepoints"],
+        default="auto",
+        metavar="FMT",
+        help="Marker file format: auto (default), reaper, audacity, cuepoints",
     )
 
     return parser.parse_args()
@@ -609,7 +674,7 @@ def main() -> None:
     # ── Marker file ────────────────────────────────────────────────────────────
     markers = []
     if args.markers:
-        markers = load_markers(args.markers, args.fps)
+        markers = load_markers(args.markers, args.fps, fmt=args.marker_format)
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
     from tui_app import TimecodeApp
