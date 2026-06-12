@@ -710,16 +710,18 @@ class DirectTUI:
 
         self._flush()
 
+    def _clamp_scroll_to_cursor(self) -> None:
+        if self._marker_cursor < self._marker_scroll:
+            self._marker_scroll = self._marker_cursor
+        elif self._marker_cursor >= self._marker_scroll + self._n_vis:
+            self._marker_scroll = max(0, self._marker_cursor - self._n_vis + 1)
+
     def move_marker_cursor(self, delta: int) -> None:
         if not self._markers:
             return
         self._marker_cursor = max(0, min(len(self._markers) - 1,
                                          self._marker_cursor + delta))
-        # Keep cursor inside the visible window
-        if self._marker_cursor < self._marker_scroll:
-            self._marker_scroll = self._marker_cursor
-        elif self._marker_cursor >= self._marker_scroll + self._n_vis:
-            self._marker_scroll = self._marker_cursor - self._n_vis + 1
+        self._clamp_scroll_to_cursor()
 
     def selected_marker(self):
         """Return the currently selected (id, name, tc) tuple, or None."""
@@ -771,6 +773,20 @@ class DirectTUI:
             tc_display = _bold(_fg(col, tc))
             self._w(_goto(self._row(_REL_TC), 1))
             self._w(self._centre(tc_display, len(tc)), _eol())
+
+            # Auto-track marker cursor to last marker at or before current TC
+            if self._markers:
+                cur_fn = p.get_tc().frame_number
+                new_cursor = 0
+                for i, (_, _, m_tc) in enumerate(self._markers):
+                    if m_tc.frame_number <= cur_fn:
+                        new_cursor = i
+                    else:
+                        break
+                if new_cursor != self._marker_cursor:
+                    self._marker_cursor = new_cursor
+                    self._clamp_scroll_to_cursor()
+
             self._last_tc = tc
             changed = True
 
