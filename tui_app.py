@@ -180,7 +180,7 @@ class TimecodeApp(App[None]):
     #layout { height: 1fr; }
 
     #main-panel {
-        width: 1fr;
+        width: 65%;
         padding: 1 2;
         border: solid $primary;
     }
@@ -206,7 +206,7 @@ class TimecodeApp(App[None]):
     Button { margin: 0 1; min-width: 18; }
 
     #marker-panel {
-        width: 44;
+        width: 35%;
         padding: 1 1;
         border: solid $primary;
         display: none;
