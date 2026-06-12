@@ -127,6 +127,31 @@ def tc_from_frame_number(fps: float, frame_number: int) -> _LibTimecode:
     return _LibTimecode(_FPS_STR[fps], frames=frame_number + 1)
 
 
+def load_markers(path: str, fps: float) -> list:
+    """Load cue markers from a CSV file (columns: #, Name, Start TC).
+
+    Returns a list of (id, name, tc) tuples sorted by ascending timecode.
+    The header row (first field == '#') is skipped. Malformed rows are ignored.
+    """
+    import csv
+    markers = []
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            for row in csv.reader(f):
+                if len(row) < 3 or row[0].strip() == '#':
+                    continue
+                mid, name, tc_str = row[0].strip(), row[1].strip(), row[2].strip()
+                try:
+                    tc = _LibTimecode(_FPS_STR[fps], tc_str)
+                    markers.append((mid, name, tc))
+                except Exception:
+                    pass
+    except OSError as e:
+        sys.exit(f"Cannot open markers file: {e}")
+    markers.sort(key=lambda m: m[2].frame_number)
+    return markers
+
+
 # ── State ──────────────────────────────────────────────────────────────────────
 class State(IntEnum):
     STOPPED = 0
@@ -388,6 +413,26 @@ class ArtNetTimecodePlayer:
         m, s = divmod(int(dur), 60)
         return f"{m}:{s:02d}"
 
+    def seek_to_frame(self, abs_frame: int) -> None:
+        """Jump to an absolute frame position (clamps to >= start_tc)."""
+        was_playing = (self.state == State.PLAYING)
+
+        if was_playing:
+            old_ticker = self._ticker_thread
+            old_audio  = self._audio_thread_hdl
+            self.pause()
+            if old_ticker is not None: old_ticker.join(timeout=0.2)
+            if old_audio  is not None: old_audio.join(timeout=0.2)
+        elif self.state == State.STOPPED:
+            self.state      = State.PAUSED
+            self.status_msg = "Paused"
+
+        self._pause_frame_acc = max(0, abs_frame - self.start_tc.frame_number)
+        self._emit_tc_at_acc()
+
+        if was_playing:
+            self.play()
+
     def shutdown(self) -> None:
         self._stop_event.set()
         if self._ticker_thread is not None:
@@ -450,6 +495,27 @@ _REL_BORDER_BOT    = 15
 _REL_SUBTITLE      = 15  # drawn in bottom border
 UI_HEIGHT          = 16
 
+# Marker panel (populated by _configure_markers_layout when --markers is used)
+_N_MARKERS_VISIBLE = 0
+_REL_MARKERS_HDR   = 13  # header row — same slot as controls in the base layout
+_REL_MARKERS_FIRST = 14  # first marker entry row
+
+
+def _configure_markers_layout(n_visible: int) -> None:
+    """Expand the layout globals to accommodate N visible marker rows.
+
+    Inserts: markers header (1 row) + N entry rows + 1 blank row above controls.
+    Everything from _REL_CONTROLS downward shifts by (n_visible + 2).
+    """
+    global UI_HEIGHT, _REL_CONTROLS, _REL_BORDER_BOT, _REL_SUBTITLE
+    global _N_MARKERS_VISIBLE
+    _N_MARKERS_VISIBLE = n_visible
+    shift = n_visible + 2          # header + entries + trailing blank
+    _REL_CONTROLS   = 13 + shift   # was 13
+    _REL_BORDER_BOT = 15 + shift   # was 15
+    _REL_SUBTITLE   = _REL_BORDER_BOT
+    UI_HEIGHT       = 16 + shift   # was 16
+
 
 class DirectTUI:
     """
@@ -458,11 +524,19 @@ class DirectTUI:
     """
 
     def __init__(self, player: ArtNetTimecodePlayer,
-                 args: argparse.Namespace):
-        self.player = player
-        self.args   = args
-        self._out   = sys.stdout
-        self._lock  = threading.Lock()
+                 args: argparse.Namespace,
+                 markers: list = []):
+        self.player   = player
+        self.args     = args
+        self._out     = sys.stdout
+        self._lock    = threading.Lock()
+
+        # Marker navigation state
+        self._markers       = markers
+        self._n_vis         = _N_MARKERS_VISIBLE   # set by _configure_markers_layout
+        self._marker_cursor = 0
+        self._marker_scroll = 0
+        self._last_cursor   = None   # forces initial draw in refresh()
 
         # Detect terminal width; default 80
         try:
@@ -528,13 +602,26 @@ class DirectTUI:
 
         audio_str = self._audio_line()
 
-        ctrl = (
-            _rev(_bold(" SPACE ")) + _dim("  Play / Pause    ") +
-            _rev(_bold("  S  ")) + _dim("  Stop    ") +
-            _rev(_bold("  ◀  ▶  ")) + _dim("  Scrub ±5s    ") +
-            _rev(_bold("  Q  ")) + _dim("  Quit")
-        )
-        ctrl_vis = len("  SPACE   Play / Pause      S   Stop      ◀  ▶   Scrub ±5s      Q   Quit")
+        if self._markers:
+            ctrl = (
+                _rev(_bold(" SPACE ")) + _dim("  Play / Pause    ") +
+                _rev(_bold("  S  ")) + _dim("  Stop    ") +
+                _rev(_bold("  ◀  ▶  ")) + _dim("  Scrub ±5s    ") +
+                _rev(_bold("  ↑  ↓  ")) + _dim("  Markers    ") +
+                _rev(_bold("  ↩  ")) + _dim("  Jump    ") +
+                _rev(_bold("  Q  ")) + _dim("  Quit")
+            )
+            ctrl_vis = len(
+                "  SPACE   Play / Pause      S   Stop      ◀  ▶   Scrub ±5s"
+                "      ↑  ↓   Markers      ↩   Jump      Q   Quit")
+        else:
+            ctrl = (
+                _rev(_bold(" SPACE ")) + _dim("  Play / Pause    ") +
+                _rev(_bold("  S  ")) + _dim("  Stop    ") +
+                _rev(_bold("  ◀  ▶  ")) + _dim("  Scrub ±5s    ") +
+                _rev(_bold("  Q  ")) + _dim("  Quit")
+            )
+            ctrl_vis = len("  SPACE   Play / Pause      S   Stop      ◀  ▶   Scrub ±5s      Q   Quit")
 
         self._w(_hide_cursor())
         self._w(_goto(self._row(_REL_BORDER_TOP), 1))
@@ -554,6 +641,12 @@ class DirectTUI:
         info_row(_REL_FPS,     "Frame rate",  fps_str)
         info_row(_REL_START,   "Start TC",    start_str)
         info_row(_REL_AUDIO,   "Audio",       audio_str)
+
+        # Markers header (drawn once; entries are drawn in refresh via _draw_markers)
+        if self._markers:
+            self._w(_goto(self._row(_REL_MARKERS_HDR), 3))
+            dash = "─" * max(0, w - 18)
+            self._w(_dim(f"── Markers {dash}"), _eol())
 
         # Controls (centred)
         self._w(_goto(self._row(_REL_CONTROLS), 1))
@@ -583,6 +676,56 @@ class DirectTUI:
             return (_fg(32, "✓") + "  " + name
                     + _dim(f"  ({dur} @ {sr} Hz)"))
         return _fg(33, "Loading…")
+
+    # ── Marker panel ──────────────────────────────────────────────────────────
+    def _draw_markers(self) -> None:
+        """Redraw all visible marker rows."""
+        for i in range(self._n_vis):
+            rel   = _REL_MARKERS_FIRST + i
+            abs_i = self._marker_scroll + i
+            if abs_i < len(self._markers):
+                mid, name, tc = self._markers[abs_i]
+                selected  = (abs_i == self._marker_cursor)
+                arrow     = _bold(_fg(32, " ▶ ")) if selected else "   "
+                id_str    = mid[:4].ljust(4)
+                name_str  = name[:20].ljust(20)
+                tc_str    = str(tc)
+                content   = (arrow
+                             + (_bold(id_str) if selected else _dim(id_str))
+                             + "  " + (name_str if selected else _dim(name_str))
+                             + "  " + tc_str)
+            else:
+                content = ""
+            self._w(_goto(self._row(rel), 3))
+            self._w(content, _eol())
+
+        # Scroll indicators in the header row (right-aligned)
+        hdr_row = self._row(_REL_MARKERS_HDR)
+        up_ind = _dim("↑ ") if self._marker_scroll > 0 else "  "
+        dn_ind = (_dim("↓")
+                  if self._marker_scroll + self._n_vis < len(self._markers)
+                  else " ")
+        self._w(_goto(hdr_row, self._cols - 3))
+        self._w(up_ind + dn_ind)
+
+        self._flush()
+
+    def move_marker_cursor(self, delta: int) -> None:
+        if not self._markers:
+            return
+        self._marker_cursor = max(0, min(len(self._markers) - 1,
+                                         self._marker_cursor + delta))
+        # Keep cursor inside the visible window
+        if self._marker_cursor < self._marker_scroll:
+            self._marker_scroll = self._marker_cursor
+        elif self._marker_cursor >= self._marker_scroll + self._n_vis:
+            self._marker_scroll = self._marker_cursor - self._n_vis + 1
+
+    def selected_marker(self):
+        """Return the currently selected (id, name, tc) tuple, or None."""
+        if not self._markers:
+            return None
+        return self._markers[self._marker_cursor]
 
     # ── Dynamic refresh (only changed lines) ──────────────────────────────────
     def refresh(self) -> None:
@@ -646,6 +789,11 @@ class DirectTUI:
 
         if changed:
             self._flush()
+
+        # Marker list (redrawn whenever cursor moves or on first draw)
+        if self._markers and self._marker_cursor != self._last_cursor:
+            self._draw_markers()
+            self._last_cursor = self._marker_cursor
 
     # ── Enter / exit ──────────────────────────────────────────────────────────
     def __enter__(self):
@@ -756,6 +904,8 @@ Examples:
 
     parser.add_argument("--audio", metavar="FILE",
                         help="Audio file to play in sync (WAV, FLAC, OGG, AIFF…)")
+    parser.add_argument("--markers", metavar="FILE",
+                        help="CSV file of timecode markers (columns: #, Name, Start TC)")
 
     return parser.parse_args()
 
@@ -824,10 +974,20 @@ def main() -> None:
             player.shutdown()
         return
 
+    # ── Marker file ────────────────────────────────────────────────────────────
+    markers = []
+    if args.markers:
+        markers = load_markers(args.markers, args.fps)
+    if markers:
+        import shutil as _shutil
+        t_rows = _shutil.get_terminal_size().lines
+        n_vis  = max(3, min(len(markers), t_rows - 18))
+        _configure_markers_layout(n_vis)
+
     # ── Interactive TUI ────────────────────────────────────────────────────────
     read_key = _make_key_reader()
 
-    with DirectTUI(player, args) as tui:
+    with DirectTUI(player, args, markers=markers) as tui:
         try:
             while True:
                 key = read_key()
@@ -841,6 +1001,14 @@ def main() -> None:
                         player.scrub(+5.0)
                     elif k == "\x1b[d":   # left arrow  → −5s
                         player.scrub(-5.0)
+                    elif k == "\x1b[a":   # up arrow → previous marker
+                        tui.move_marker_cursor(-1)
+                    elif k == "\x1b[b":   # down arrow → next marker
+                        tui.move_marker_cursor(+1)
+                    elif k == "\r":       # Enter → jump to selected marker
+                        m = tui.selected_marker()
+                        if m:
+                            player.seek_to_frame(m[2].frame_number)
                     elif k in ("q", "\x03", "\x1b"):   # q / Ctrl-C / Esc
                         break
                 tui.refresh()
