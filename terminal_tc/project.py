@@ -98,7 +98,18 @@ def export_project(cfg: AppConfig, output_path: Path) -> None:
 def import_project(tcp_path: Path, extract_dir: Path) -> AppConfig:
     """Extract a .tcp bundle into extract_dir and return a ready-to-use AppConfig."""
     extract_dir.mkdir(parents=True, exist_ok=True)
+    base = extract_dir.resolve()
+
     with zipfile.ZipFile(tcp_path, "r") as zf:
+        for member in zf.infolist():
+            name = member.filename
+            # Reject absolute paths, Windows drive letters, and backslash prefixes
+            if name.startswith(("/", "\\")) or os.path.isabs(name) or ":" in name:
+                raise ValueError(f"Unsafe path in archive: {name!r}")
+            target = (base / name).resolve()
+            # Reject paths that escape the extract directory (Zip Slip)
+            if target != base and not str(target).startswith(str(base) + os.sep):
+                raise ValueError(f"Path traversal detected in archive: {name!r}")
         zf.extractall(extract_dir)
 
     with open(extract_dir / "project.json", encoding="utf-8") as f:
@@ -113,10 +124,17 @@ def import_project(tcp_path: Path, extract_dir: Path) -> AppConfig:
         if not isinstance(t, dict):
             continue
         fields = {k: v for k, v in t.items() if k in known_track}
-        if fields.get("audio"):
-            fields["audio"] = str(extract_dir / fields["audio"])
-        if fields.get("markers"):
-            fields["markers"] = str(extract_dir / fields["markers"])
+        for key in ("audio", "markers"):
+            rel = fields.get(key)
+            if not rel:
+                continue
+            resolved = (base / rel).resolve()
+            # Only accept paths that land inside the extract directory
+            if resolved != base and not str(resolved).startswith(str(base) + os.sep):
+                raise ValueError(
+                    f"Track {key!r} path escapes extract directory: {rel!r}"
+                )
+            fields[key] = str(resolved)
         tracks.append(TrackConfig(**fields))
 
     cfg.tracks = tracks or [TrackConfig()]
