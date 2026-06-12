@@ -11,12 +11,25 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import zipfile
 from pathlib import Path
 
 from .config import AppConfig, TrackConfig, _config_from_dict, save_config
 
 PROJECT_DIR = Path.home() / ".config" / "artnet-timecode" / "projects"
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9 _.\-]{1,64}$")
+
+
+def _safe_project_path(name: str) -> Path:
+    """Return the resolved .json path for name, or raise ValueError if unsafe."""
+    if not name or not _SAFE_NAME.match(name) or name in (".", ".."):
+        raise ValueError(f"Invalid project name: {name!r}")
+    candidate = (PROJECT_DIR / f"{name}.json").resolve()
+    if candidate.parent != PROJECT_DIR.resolve():
+        raise ValueError(f"Project name escapes project directory: {name!r}")
+    return candidate
 
 
 def list_projects() -> list[str]:
@@ -28,7 +41,7 @@ def list_projects() -> list[str]:
 
 def load_project(name: str) -> AppConfig:
     """Load a named project from PROJECT_DIR. Raises FileNotFoundError if absent."""
-    path = PROJECT_DIR / f"{name}.json"
+    path = _safe_project_path(name)
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     cfg = _config_from_dict(data)
@@ -40,8 +53,7 @@ def load_project(name: str) -> AppConfig:
 def save_project(cfg: AppConfig) -> None:
     """Write the project to PROJECT_DIR/<name>.json and update the active config.json."""
     PROJECT_DIR.mkdir(parents=True, exist_ok=True)
-    name = cfg.project_name or "Default"
-    path = PROJECT_DIR / f"{name}.json"
+    path = _safe_project_path(cfg.project_name or "Default")
     tmp = str(path) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=2)
@@ -51,7 +63,7 @@ def save_project(cfg: AppConfig) -> None:
 
 def delete_project(name: str) -> None:
     """Delete a named project file. Raises FileNotFoundError if absent."""
-    (PROJECT_DIR / f"{name}.json").unlink()
+    _safe_project_path(name).unlink()
 
 
 def export_project(cfg: AppConfig, output_path: Path) -> None:
@@ -138,6 +150,14 @@ def import_project(tcp_path: Path, extract_dir: Path) -> AppConfig:
         tracks.append(TrackConfig(**fields))
 
     cfg.tracks = tracks or [TrackConfig()]
+
+    # Ensure the imported project_name is safe before the caller calls save_project.
+    # A crafted bundle could set project_name to e.g. "../../evil" to escape PROJECT_DIR.
+    try:
+        _safe_project_path(cfg.project_name)
+    except ValueError:
+        cfg.project_name = "Imported Project"
+
     return cfg
 
 
