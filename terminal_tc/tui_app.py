@@ -228,6 +228,7 @@ class WaveformWidget(Widget):
         self._view_end: float = 1.0
         self._total_samples: int = 0
         self._view_env_cache: "tuple | None" = None
+        self._manually_panned: bool = False
 
     def _compute_envelope(self) -> None:
         self._envelope = None
@@ -405,9 +406,9 @@ class WaveformWidget(Widget):
     _ZOOM_FACTOR = 2.0
 
     def _zoom(self, direction: int) -> None:
-        """Zoom in (direction=+1) or out (direction=-1), centred on current view."""
+        """Zoom in (direction=+1) or out (direction=-1)."""
         vs, ve = self._view_start, self._view_end
-        center = (vs + ve) / 2
+        center = (vs + ve) / 2 if self._manually_panned else self._playhead_frac
         span = ve - vs
         new_span = (
             span / self._ZOOM_FACTOR if direction > 0 else span * self._ZOOM_FACTOR
@@ -418,6 +419,8 @@ class WaveformWidget(Widget):
         new_start = max(0.0, min(1.0 - new_span, center - new_span / 2))
         self._view_start = new_start
         self._view_end = new_start + new_span
+        if new_span >= 1.0:
+            self._manually_panned = False
         self._view_env_cache = None
         self.refresh()
 
@@ -428,6 +431,7 @@ class WaveformWidget(Widget):
         new_start = max(0.0, min(1.0 - span, self._view_start + direction * step))
         self._view_start = new_start
         self._view_end = new_start + span
+        self._manually_panned = True
         self._view_env_cache = None
         self.refresh()
 
@@ -435,6 +439,7 @@ class WaveformWidget(Widget):
         """Reset to full-audio view."""
         self._view_start = 0.0
         self._view_end = 1.0
+        self._manually_panned = False
         self._view_env_cache = None
         self.refresh()
 
