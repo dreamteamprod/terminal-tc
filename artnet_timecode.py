@@ -36,15 +36,40 @@ except ImportError:
     sys.exit("Missing dependency: pip install timecode")
 
 try:
+    import numpy as np
+    _NP_AVAILABLE = True
+except ImportError:
+    _NP_AVAILABLE = False
+
+try:
     import sounddevice as sd
     import soundfile as sf
-    import numpy as np
-
-    AUDIO_AVAILABLE = True
+    AUDIO_AVAILABLE = _NP_AVAILABLE
 except ImportError:
     AUDIO_AVAILABLE = False
 except OSError:
+    # PortAudio not installed (common on WSL/headless Linux)
     AUDIO_AVAILABLE = False
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _is_wsl() -> bool:
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def _wsl_audio_hint() -> str:
+    """Return a fix hint when no audio output devices are found on WSL."""
+    import glob
+    plugin = glob.glob("/usr/lib/*/alsa-lib/libasound_module_pcm_pulse.so")
+    if not plugin:
+        return (
+            "No audio devices on WSL — fix: sudo apt install libasound2-plugins"
+        )
+    return "No audio devices — ALSA pulse plugin present but PortAudio sees no outputs"
+
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ARTNET_PORT = 6454
@@ -281,7 +306,21 @@ class ArtNetTimecodePlayer:
     # ── Audio ──────────────────────────────────────────────────────────────────
     def _load_audio(self, path: str) -> None:
         if not AUDIO_AVAILABLE:
-            self._audio_error = "sounddevice/soundfile unavailable (install deps)"
+            if _is_wsl():
+                self._audio_error = (
+                    "Audio unavailable on WSL — "
+                    "sudo apt install libportaudio2 libsndfile1 && "
+                    "pip install sounddevice soundfile"
+                )
+            else:
+                self._audio_error = "Audio unavailable — pip install sounddevice soundfile"
+            return
+        try:
+            has_output = any(d["max_output_channels"] > 0 for d in sd.query_devices())
+        except Exception:
+            has_output = True  # can't check; proceed and let playback fail naturally
+        if not has_output:
+            self._audio_error = _wsl_audio_hint() if _is_wsl() else "No audio output devices found"
             return
         if not os.path.isfile(path):
             self._audio_error = f"File not found: {path}"

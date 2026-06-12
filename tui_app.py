@@ -195,7 +195,7 @@ class WaveformWidget(Widget):
 
     DEFAULT_CSS = """
     WaveformWidget {
-        height: 10;
+        height: 12;
         width: 100%;
         margin: 0 0 1 0;
     }
@@ -209,6 +209,10 @@ class WaveformWidget(Widget):
         self._markers = markers
         self._envelope: "np.ndarray | None" = None
         self._audio_duration_secs: float = 0.0
+        self._view_start: float = 0.0
+        self._view_end: float = 1.0
+        self._total_samples: int = 0
+        self._view_env_cache: "tuple | None" = None
 
     def _compute_envelope(self) -> None:
         self._envelope = None
@@ -218,7 +222,7 @@ class WaveformWidget(Widget):
             return
         mono = np.abs(p._audio_data.mean(axis=1))
         N = len(mono)
-        HIRES = 2000
+        HIRES = 8000
         trim = (N // HIRES) * HIRES
         envelope = mono[:trim].reshape(HIRES, -1).max(axis=1) if trim > 0 else mono
         peak = float(envelope.max())
@@ -228,6 +232,8 @@ class WaveformWidget(Widget):
             else envelope.astype(np.float32)
         )
         self._audio_duration_secs = N / p._audio_samplerate
+        self._total_samples = N
+        self._global_peak: float = peak
 
     def on_mount(self) -> None:
         self._compute_envelope()
@@ -237,50 +243,129 @@ class WaveformWidget(Widget):
         self._player = player
         self._markers = markers
         self._playhead_frac = 0.0
+        self._view_start = 0.0
+        self._view_end = 1.0
+        self._view_env_cache = None
         self._compute_envelope()
         self.refresh()
+
+    def _frac_to_col(self, frac: float, W: int) -> "int | None":
+        """Map an audio fraction (0–1) to a screen column, or None if out of view."""
+        vs, ve = self._view_start, self._view_end
+        span = ve - vs
+        if span <= 0 or not (vs <= frac <= ve):
+            return None
+        return int((frac - vs) / span * (W - 1))
 
     def render(self) -> Text:
         if self._envelope is None:
             return Text("  No audio loaded", style="dim italic")
 
+        LABEL_ROWS = 2
         W = max(1, self.size.width)
         H = max(1, self.size.height)
+        WAVE_H = max(1, H - LABEL_ROWS)
 
         env = self._envelope
         n = len(env)
-        if n >= W:
-            starts = np.arange(W) * n // W
-            cols = np.maximum.reduceat(env, starts)[:W]
+        i_start = int(self._view_start * n)
+        i_end = max(i_start + 1, int(self._view_end * n))
+
+        cache_key = (round(self._view_start, 4), round(self._view_end, 4), W)
+        if self._view_env_cache and self._view_env_cache[0] == cache_key:
+            cols = self._view_env_cache[1]
         else:
-            cols = np.interp(np.arange(W), np.linspace(0, W - 1, n), env).astype(
-                np.float32
-            )
+            if (
+                (i_end - i_start) < W
+                and self._total_samples > 0
+                and self._player._audio_data is not None
+            ):
+                s0 = int(self._view_start * self._total_samples)
+                s1 = max(s0 + 1, int(self._view_end * self._total_samples))
+                raw = np.abs(self._player._audio_data[s0:s1].mean(axis=1)).astype(np.float32)
+                g_peak = getattr(self, "_global_peak", 0.0) or float(raw.max())
+                slice_env = raw / g_peak if g_peak > 0 else raw
+            else:
+                slice_env = env[i_start:i_end]
 
-        ph_col = int(self._playhead_frac * (W - 1))
+            m = len(slice_env)
+            if m >= W:
+                starts = np.arange(W) * m // W
+                cols = np.maximum.reduceat(slice_env, starts)[:W]
+            else:
+                cols = np.interp(
+                    np.arange(W), np.linspace(0, W - 1, m), slice_env
+                ).astype(np.float32)
+            self._view_env_cache = (cache_key, cols)
 
-        marker_cols: set[int] = set()
+        ph_col = self._frac_to_col(self._playhead_frac, W)
+
+        # Active marker: last one whose TC is at or before the current playhead
+        active_marker_idx = -1
+        visible_markers: "list[tuple[int, str, bool]]" = []  # (col, label, is_active)
         if self._audio_duration_secs > 0:
             p = self._player
             start_fn = p.start_tc.frame_number
             total_frames = self._audio_duration_secs * p.fps
-            for _, _, tc in self._markers:
+            current_frame = start_fn + self._playhead_frac * total_frames
+            for i, (_, _, tc) in enumerate(self._markers):
+                if tc.frame_number <= current_frame:
+                    active_marker_idx = i
+                else:
+                    break
+            for i, (mid, name, tc) in enumerate(self._markers):
                 frac = (tc.frame_number - start_fn) / total_frames
-                if 0.0 <= frac <= 1.0:
-                    marker_cols.add(int(frac * (W - 1)))
+                col = self._frac_to_col(frac, W)
+                if col is not None:
+                    label = f"{mid}:{name}" if mid else name
+                    visible_markers.append((col, label, i == active_marker_idx))
+        visible_markers.sort(key=lambda x: x[0])
+        marker_col_set = {col for col, _, _ in visible_markers}
 
-        # Half-block rendering: each terminal row = 2 vertical "half-rows",
-        # giving 2x vertical resolution using ▀ / ▄ / █.
-        center_hr = H - 0.5  # centre of the widget in half-row units
-        fill_radii = cols * center_hr  # per-column fill radius (broadcast-ready)
+        # Build the two label rows
+        label_chars: "list[tuple[str, str | None]]" = [(" ", None)] * W
+        connect_chars: "list[tuple[str, str | None]]" = [(" ", None)] * W
+
+        for i, (col, label, is_active) in enumerate(visible_markers):
+            next_col = visible_markers[i + 1][0] if i + 1 < len(visible_markers) else W
+            max_len = max(0, min(next_col - col - 1, W - col))
+            style = "bold bright_white" if is_active else "bold bright_yellow"
+            for j, ch in enumerate(label[:max_len]):
+                if col + j < W:
+                    label_chars[col + j] = (ch, style)
+            connect_chars[col] = ("▼", style)
+
+        if ph_col is not None:
+            connect_chars[ph_col] = ("│", "bold bright_white")
 
         out = Text()
-        for row in range(H):
+
+        # Row 0: marker name labels
+        for ch, style in label_chars:
+            if style:
+                out.append(ch, style=style)
+            else:
+                out.append(ch)
+        out.append("\n")
+
+        # Row 1: ▼ connectors and playhead
+        for ch, style in connect_chars:
+            if style:
+                out.append(ch, style=style)
+            else:
+                out.append(ch)
+        out.append("\n")
+
+        # Half-block waveform rows
+        center_hr = WAVE_H - 0.5
+        fill_radii = cols * center_hr
+
+        for row in range(WAVE_H):
             if row > 0:
                 out.append("\n")
             upper_dist = abs(2 * row - center_hr)
             lower_dist = abs(2 * row + 1 - center_hr)
-            upper_filled = upper_dist <= fill_radii  # shape (W,) bool
+            upper_filled = upper_dist <= fill_radii
             lower_filled = lower_dist <= fill_radii
 
             for x in range(W):
@@ -290,13 +375,59 @@ class WaveformWidget(Widget):
 
                 if x == ph_col:
                     out.append("│", style="bold bright_white")
-                elif x in marker_cols:
+                elif x in marker_col_set:
                     out.append("│", style="bold bright_yellow")
                 elif u or lo:
                     out.append(char, style="green dim")
                 else:
                     out.append(" ")
         return out
+
+    # ── Zoom / pan ─────────────────────────────────────────────────────────────
+
+    _ZOOM_FACTOR = 2.0
+
+    def _zoom(self, direction: int) -> None:
+        """Zoom in (direction=+1) or out (direction=-1), centred on current view."""
+        vs, ve = self._view_start, self._view_end
+        center = (vs + ve) / 2
+        span = ve - vs
+        new_span = span / self._ZOOM_FACTOR if direction > 0 else span * self._ZOOM_FACTOR
+        n = len(self._envelope) if self._envelope is not None else 8000
+        min_span = max(8.0 / n, 4.0 / max(1, self.size.width))
+        new_span = max(min_span, min(1.0, new_span))
+        new_start = max(0.0, min(1.0 - new_span, center - new_span / 2))
+        self._view_start = new_start
+        self._view_end = new_start + new_span
+        self._view_env_cache = None
+        self.refresh()
+
+    def _pan(self, direction: int) -> None:
+        """Pan left (direction=-1) or right (direction=+1) by 20% of current window."""
+        span = self._view_end - self._view_start
+        step = span * 0.20
+        new_start = max(0.0, min(1.0 - span, self._view_start + direction * step))
+        self._view_start = new_start
+        self._view_end = new_start + span
+        self._view_env_cache = None
+        self.refresh()
+
+    def reset_view(self) -> None:
+        """Reset to full-audio view."""
+        self._view_start = 0.0
+        self._view_end = 1.0
+        self._view_env_cache = None
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if self._envelope is not None:
+            self._pan(+1)
+            event.stop()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        if self._envelope is not None:
+            self._pan(-1)
+            event.stop()
 
 
 class TrackList(Widget):
@@ -416,6 +547,11 @@ class TimecodeCommands(Provider):
         ("Next Marker", "Go to next cue marker", "action_next_marker"),
         ("Jump to Marker", "Seek to selected marker", "action_jump_marker"),
         ("Toggle Waveform", "Show or hide waveform", "action_toggle_waveform"),
+        ("Zoom In", "Zoom waveform in", "action_zoom_in"),
+        ("Zoom Out", "Zoom waveform out", "action_zoom_out"),
+        ("Pan Left", "Pan waveform left", "action_pan_left"),
+        ("Pan Right", "Pan waveform right", "action_pan_right"),
+        ("Full View", "Reset waveform zoom to full audio", "action_reset_zoom"),
         ("Add Track", "Add a new track to the session", "action_add_track"),
         ("Edit Track", "Edit the selected track", "action_edit_track"),
         ("Delete Track", "Delete the selected track", "action_delete_track"),
@@ -457,6 +593,11 @@ class TimecodeApp(App[None]):
         Binding("down", "next_marker", "Next marker"),
         Binding("enter", "jump_marker", "Jump", priority=True),
         Binding("w", "toggle_waveform", "Waveform"),
+        Binding("[", "zoom_in", "Zoom In"),
+        Binding("]", "zoom_out", "Zoom Out"),
+        Binding("shift+left", "pan_left", "Pan ←"),
+        Binding("shift+right", "pan_right", "Pan →"),
+        Binding("0", "reset_zoom", "Full View"),
         Binding("t", "focus_tracks", "Tracks"),
         Binding("m", "focus_markers", "Markers"),
         Binding("a", "add_track", "Add Track"),
@@ -630,10 +771,20 @@ class TimecodeApp(App[None]):
                     )
                     W = wf.size.width
                     if W > 0:
-                        col = int(frac * (W - 1))
-                        if col != self._last_wave_col:
+                        view_col = wf._frac_to_col(frac, W)
+                        view_col_key = view_col if view_col is not None else -1
+                        if view_col_key != self._last_wave_col:
                             wf._playhead_frac = frac
-                            self._last_wave_col = col
+                            self._last_wave_col = view_col_key
+                    # Auto-follow: when playing and zoomed in, keep playhead in view
+                    if state_int == 1 and (wf._view_end - wf._view_start) < 1.0:
+                        if not (wf._view_start <= frac <= wf._view_end):
+                            span = wf._view_end - wf._view_start
+                            new_start = max(0.0, min(1.0 - span, frac - 0.20 * span))
+                            wf._view_start = new_start
+                            wf._view_end = new_start + span
+                            wf._view_env_cache = None
+                            wf.refresh()
         except NoMatches:
             pass  # widget tree is mid-recompose; skip this tick
 
@@ -767,6 +918,21 @@ class TimecodeApp(App[None]):
         wf = self.query_one("#waveform", WaveformWidget)
         wf.display = not wf.display
 
+    def action_zoom_in(self) -> None:
+        self.query_one("#waveform", WaveformWidget)._zoom(+1)
+
+    def action_zoom_out(self) -> None:
+        self.query_one("#waveform", WaveformWidget)._zoom(-1)
+
+    def action_pan_left(self) -> None:
+        self.query_one("#waveform", WaveformWidget)._pan(-1)
+
+    def action_pan_right(self) -> None:
+        self.query_one("#waveform", WaveformWidget)._pan(+1)
+
+    def action_reset_zoom(self) -> None:
+        self.query_one("#waveform", WaveformWidget).reset_view()
+
     def action_toggle_play(self) -> None:
         self._player.toggle_play_pause()
 
@@ -786,6 +952,12 @@ class TimecodeApp(App[None]):
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("zoom_in", "zoom_out", "pan_left", "pan_right", "reset_zoom"):
+            try:
+                wf = self.query_one("#waveform", WaveformWidget)
+                return bool(wf.display and wf._envelope is not None)
+            except NoMatches:
+                return False
         if action in ("add_track", "edit_track", "delete_track"):
             return True if self._nav_mode == "tracks" else False
         if action in ("prev_marker", "next_marker", "jump_marker"):
