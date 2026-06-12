@@ -17,6 +17,7 @@ Usage examples:
 """
 
 import argparse
+import dataclasses
 import socket
 import struct
 import sys
@@ -25,6 +26,8 @@ import time
 import os
 from enum import IntEnum
 from typing import Optional
+
+from config import AppConfig, SUPPORTED_FPS, load_config, validate_config
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 try:
@@ -47,8 +50,6 @@ except OSError:
 ARTNET_PORT = 6454
 ARTNET_ID = b"Art-Net\x00"
 OP_TIMECODE = 0x9700  # ArtTimeCode opcode
-
-SUPPORTED_FPS = [24, 25, 29.97, 30]
 
 FPS_TYPE_MAP = {  # Art-Net type field values
     24: 0,
@@ -143,6 +144,7 @@ def _detect_marker_format(path: str) -> str:
 
 def _parse_reaper_markers(f, fps: float) -> list:
     import csv
+
     markers = []
     for row in csv.reader(f):
         if len(row) < 3 or row[0].strip() == "#":
@@ -174,6 +176,7 @@ def _parse_audacity_markers(f, fps: float) -> list:
 
 def _parse_cuepoints_markers(f, fps: float) -> list:
     import csv
+
     markers = []
     for row in csv.reader(f, delimiter="\t"):
         if len(row) < 5 or row[0].strip() == "Track":
@@ -535,26 +538,29 @@ Examples:
     net = parser.add_argument_group("Network")
     net.add_argument(
         "--ip",
-        default="2.255.255.255",
+        default=argparse.SUPPRESS,
         metavar="ADDR",
-        help="Destination IP (default: 2.255.255.255)",
+        help="Destination IP (default: auto-detected broadcast)",
     )
     net.add_argument(
         "--port",
         type=int,
-        default=ARTNET_PORT,
+        default=argparse.SUPPRESS,
         metavar="PORT",
         help=f"UDP port (default: {ARTNET_PORT})",
     )
     net.add_argument(
-        "--broadcast", action="store_true", help="Force SO_BROADCAST on the socket"
+        "--broadcast",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Force SO_BROADCAST on the socket",
     )
 
     tc_g = parser.add_argument_group("Timecode")
     tc_g.add_argument(
         "--fps",
         type=float,
-        default=25.0,
+        default=argparse.SUPPRESS,
         choices=SUPPORTED_FPS,
         metavar="FPS",
         help="Frame rate: 24 | 25 | 29.97 | 30  (default: 25)",
@@ -562,46 +568,48 @@ Examples:
     tc_g.add_argument(
         "--start-hours",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         metavar="HH",
         help="Start timecode hours   (default: 0)",
     )
     tc_g.add_argument(
         "--start-minutes",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         metavar="MM",
         help="Start timecode minutes (default: 0)",
     )
     tc_g.add_argument(
         "--start-seconds",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         metavar="SS",
         help="Start timecode seconds (default: 0)",
     )
     tc_g.add_argument(
         "--start-frames",
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         metavar="FF",
         help="Start timecode frames  (default: 0)",
     )
 
     parser.add_argument(
         "--audio",
+        default=argparse.SUPPRESS,
         metavar="FILE",
         help="Audio file to play in sync (WAV, FLAC, OGG, AIFF…)",
     )
     parser.add_argument(
         "--markers",
+        default=argparse.SUPPRESS,
         metavar="FILE",
         help="Marker file (Reaper CSV, Audacity labels, or CuePoints spreadsheet; auto-detected)",
     )
     parser.add_argument(
         "--marker-format",
         choices=["auto", "reaper", "audacity", "cuepoints"],
-        default="auto",
+        default=argparse.SUPPRESS,
         metavar="FMT",
         help="Marker file format: auto (default), reaper, audacity, cuepoints",
     )
@@ -609,52 +617,66 @@ Examples:
     return parser.parse_args()
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    errs = []
-    if args.fps not in SUPPORTED_FPS:
-        errs.append(f"--fps must be one of {SUPPORTED_FPS}")
-    if not (0 <= args.start_hours <= 23):
-        errs.append("--start-hours must be 0–23")
-    if not (0 <= args.start_minutes <= 59):
-        errs.append("--start-minutes must be 0–59")
-    if not (0 <= args.start_seconds <= 59):
-        errs.append("--start-seconds must be 0–59")
-    max_frames = round(args.fps) - 1
-    if not (0 <= args.start_frames <= max_frames):
-        errs.append(f"--start-frames must be 0–{max_frames} for {args.fps} fps")
-    if args.audio and not os.path.isfile(args.audio):
-        errs.append(f"Audio file not found: {args.audio}")
+def build_player(cfg: AppConfig) -> "ArtNetTimecodePlayer":
+    """Construct a player from a fully-merged AppConfig."""
+    start_tc = make_tc(
+        fps=cfg.fps,
+        hours=cfg.start_hours,
+        minutes=cfg.start_minutes,
+        seconds=cfg.start_seconds,
+        frames=cfg.start_frames,
+    )
+    return ArtNetTimecodePlayer(
+        start_tc=start_tc,
+        fps=cfg.fps,
+        dest_ip=cfg.ip,
+        dest_port=cfg.port,
+        audio_path=cfg.audio,
+        broadcast=cfg.broadcast,
+    )
+
+
+def build_markers(cfg: AppConfig) -> list:
+    """Load marker file described by cfg, or return [] if none configured."""
+    if not cfg.markers:
+        return []
+    return load_markers(cfg.markers, cfg.fps, fmt=cfg.marker_format)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main() -> None:
+    # Three-layer merge: defaults → saved JSON → explicit CLI flags
+    cli_dict = vars(parse_args())
+    defaults_dict = dataclasses.asdict(AppConfig())
+    saved_dict = dataclasses.asdict(load_config())
+    config = AppConfig(**{**defaults_dict, **saved_dict, **cli_dict})
+
+    # Auto-enable broadcast for .255 addresses
+    if config.ip.endswith(".255"):
+        config.broadcast = True
+
+    # Always-fatal: numeric / fps / TC-range constraint violations
+    errs = validate_config(config, check_files=False)
     if errs:
         for e in errs:
             print(f"  ✗ {e}", file=sys.stderr)
         sys.exit(1)
 
+    # File paths passed explicitly on the CLI → fatal if missing
+    if "audio" in cli_dict and config.audio and not os.path.isfile(config.audio):
+        print(f"  ✗ Audio file not found: {config.audio}", file=sys.stderr)
+        sys.exit(1)
+    if "markers" in cli_dict and config.markers and not os.path.isfile(config.markers):
+        print(f"  ✗ Markers file not found: {config.markers}", file=sys.stderr)
+        sys.exit(1)
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
+    # Stale saved-config file paths → clear silently so TUI can open
+    if config.audio and not os.path.isfile(config.audio):
+        config.audio = None
+    if config.markers and not os.path.isfile(config.markers):
+        config.markers = None
 
-    # Auto-enable broadcast for .255 addresses
-    if args.ip.endswith(".255"):
-        args.broadcast = True
-
-    start_tc = make_tc(
-        fps=args.fps,
-        hours=args.start_hours,
-        minutes=args.start_minutes,
-        seconds=args.start_seconds,
-        frames=args.start_frames,
-    )
-
-    player = ArtNetTimecodePlayer(
-        start_tc=start_tc,
-        fps=args.fps,
-        dest_ip=args.ip,
-        dest_port=args.port,
-        audio_path=args.audio,
-        broadcast=args.broadcast,
-    )
+    player = build_player(config)
 
     # ── Non-interactive fallback (piped stdin / CI) ────────────────────────────
     if not _is_interactive():
@@ -671,15 +693,12 @@ def main() -> None:
             player.shutdown()
         return
 
-    # ── Marker file ────────────────────────────────────────────────────────────
-    markers = []
-    if args.markers:
-        markers = load_markers(args.markers, args.fps, fmt=args.marker_format)
+    markers = build_markers(config)
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
     from tui_app import TimecodeApp
 
-    TimecodeApp(player, args, markers=markers).run()
+    TimecodeApp(config, player, markers=markers).run()
     print(f"\nStopped. {player.packet_count:,} Art-Net packets sent.\n")
 
 
