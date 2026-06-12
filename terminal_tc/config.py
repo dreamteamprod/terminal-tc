@@ -71,6 +71,7 @@ class AppConfig:
     port: int = 6454
     broadcast: bool = False
     fps: float = 25.0
+    project_name: str = "Default"
     # Kept for CLI backwards compat — single-track path in main()
     start_hours: int = 0
     start_minutes: int = 0
@@ -82,27 +83,31 @@ class AppConfig:
     tracks: list = dataclasses.field(default_factory=list)  # list[TrackConfig]
 
 
+def _config_from_dict(data: dict) -> AppConfig:
+    """Parse a raw JSON dict into an AppConfig with proper TrackConfig objects."""
+    known_app = {field.name for field in dataclasses.fields(AppConfig)}
+    known_track = {field.name for field in dataclasses.fields(TrackConfig)}
+    filtered = {k: v for k, v in data.items() if k in known_app}
+    if "fps" in filtered:
+        filtered["fps"] = float(filtered["fps"])
+    # dataclasses.asdict() serialises TrackConfig as plain dicts — re-inflate manually
+    raw_tracks = filtered.pop("tracks", [])
+    tracks = [
+        TrackConfig(**{k: v for k, v in t.items() if k in known_track})
+        for t in raw_tracks
+        if isinstance(t, dict)
+    ]
+    cfg = AppConfig(**filtered)
+    cfg.tracks = tracks
+    return cfg
+
+
 def load_config() -> AppConfig:
     """Load persisted config. Returns AppConfig() with defaults on any error."""
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        known_app = {field.name for field in dataclasses.fields(AppConfig)}
-        known_track = {field.name for field in dataclasses.fields(TrackConfig)}
-        filtered = {k: v for k, v in data.items() if k in known_app}
-        if "fps" in filtered:
-            filtered["fps"] = float(filtered["fps"])
-
-        # dataclasses.asdict() serialises TrackConfig as plain dicts — re-inflate manually
-        raw_tracks = filtered.pop("tracks", [])
-        tracks = [
-            TrackConfig(**{k: v for k, v in t.items() if k in known_track})
-            for t in raw_tracks
-            if isinstance(t, dict)
-        ]
-
-        cfg = AppConfig(**filtered)
-        cfg.tracks = tracks
+        cfg = _config_from_dict(data)
     except (OSError, json.JSONDecodeError, TypeError):
         cfg = AppConfig()
 

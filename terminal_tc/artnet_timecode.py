@@ -659,6 +659,26 @@ Examples:
         help="Marker file format: auto (default), reaper, audacity, cuepoints",
     )
 
+    proj = parser.add_argument_group("Projects")
+    proj.add_argument(
+        "--open-project",
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help="Open a saved project by name before starting",
+    )
+    proj.add_argument(
+        "--export-project",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="Export the current project to a .tcp bundle, then exit",
+    )
+    proj.add_argument(
+        "--import-project",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="Import a .tcp bundle (you will be prompted for an extract directory), then exit",
+    )
+
     return parser.parse_args()
 
 
@@ -729,11 +749,24 @@ def build_markers_from_track(track, fps: float) -> list:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
+    from .project import load_project, save_project, export_project, import_project
+    from pathlib import Path
+
     # Three-layer merge: defaults → saved JSON → explicit CLI flags.
     # Tracks are handled separately: load_config() returns proper TrackConfig
     # objects; asdict() would flatten them back to dicts and lose the type.
     cli_dict = vars(parse_args())
     saved_config = load_config()  # already has TrackConfig objects + migration applied
+
+    # --open-project: swap saved_config before the merge
+    if "open_project" in cli_dict:
+        name = cli_dict.pop("open_project")
+        try:
+            saved_config = load_project(name)
+        except FileNotFoundError:
+            print(f"  ✗ No project named '{name}' found.", file=sys.stderr)
+            sys.exit(1)
+
     defaults_dict = dataclasses.asdict(AppConfig())
     saved_flat = dataclasses.asdict(saved_config)
     saved_flat.pop("tracks", None)
@@ -741,6 +774,28 @@ def main() -> None:
     cli_dict.pop("tracks", None)
     config = AppConfig(**{**defaults_dict, **saved_flat, **cli_dict})
     config.tracks = saved_config.tracks  # preserve the properly-typed TrackConfig list
+
+    # --export-project: write bundle and exit
+    if "export_project" in cli_dict:
+        out = Path(cli_dict["export_project"])
+        export_project(config, out)
+        print(f"Exported project '{config.project_name}' → {out}")
+        return
+
+    # --import-project: extract bundle, save as active project, and exit
+    if "import_project" in cli_dict:
+        tcp_path = Path(cli_dict["import_project"])
+        if not tcp_path.is_file():
+            print(f"  ✗ File not found: {tcp_path}", file=sys.stderr)
+            sys.exit(1)
+        extract_dir_str = input("Extract to directory: ").strip()
+        if not extract_dir_str:
+            print("  ✗ No directory given.", file=sys.stderr)
+            sys.exit(1)
+        imported = import_project(tcp_path, Path(extract_dir_str))
+        save_project(imported)
+        print(f"Imported project '{imported.project_name}' → {extract_dir_str}")
+        return
 
     # Auto-enable broadcast for .255 addresses
     if config.ip.endswith(".255"):

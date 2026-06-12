@@ -28,6 +28,8 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    ListItem,
+    ListView,
     Select,
     Static,
     Switch,
@@ -41,6 +43,14 @@ from .config import (
     TrackConfig,
     save_config,
     validate_track_config,
+)
+from .project import (
+    delete_project,
+    export_project,
+    import_project,
+    list_projects,
+    load_project,
+    save_project,
 )
 
 if TYPE_CHECKING:
@@ -619,6 +629,8 @@ class TimecodeApp(App[None]):
         Binding("d", "delete_track", "Del Track"),
         Binding("x", "export_markers", "Export"),
         Binding("ctrl+comma", "open_settings", "Settings"),
+        Binding("p", "open_projects", "Projects"),
+        Binding("ctrl+s", "save_project", "Save Project", show=False),
         Binding("q", "quit", "Quit", priority=True),
         Binding("escape", "quit", "Quit", show=False),
     ]
@@ -690,6 +702,7 @@ class TimecodeApp(App[None]):
         self._tracks: list = tracks if tracks is not None else list(config.tracks)
         self._active_idx: int = 0
         self._nav_mode: str = ""  # "", "tracks", or "markers"
+        self.sub_title = config.project_name
 
     def compose(self) -> ComposeResult:
         p = self._player
@@ -858,6 +871,7 @@ class TimecodeApp(App[None]):
         new_track: TrackConfig | None = await self.push_screen_wait(
             TrackEditModal(None, self._config.fps)
         )
+        self.refresh_bindings()
         if new_track is None:
             return
         self._tracks.append(new_track)
@@ -873,6 +887,7 @@ class TimecodeApp(App[None]):
         updated: TrackConfig | None = await self.push_screen_wait(
             TrackEditModal(self._tracks[idx], self._config.fps)
         )
+        self.refresh_bindings()
         if updated is None:
             return
         self._tracks[idx] = updated
@@ -910,6 +925,7 @@ class TimecodeApp(App[None]):
             SettingsScreen(self._config, self._tracks)
         )
         if result is None:
+            self.refresh_bindings()
             return
         new_config, new_tracks = result
         self._player.stop()
@@ -930,11 +946,47 @@ class TimecodeApp(App[None]):
         self._last_frame = -1
         self._last_wave_col = -1
         await self.recompose()
+        self.refresh_bindings()
         if self._markers:
             self.query_one("#marker-panel").add_class("visible")
         self.query_one("#track-list", TrackList).set_tracks(
             self._tracks, self._active_idx
         )
+
+    # ── Projects ──────────────────────────────────────
+
+    def action_save_project(self) -> None:
+        save_project(self._update_config_tracks())
+        self.notify(f"Saved project '{self._config.project_name}'")
+
+    @work
+    async def action_open_projects(self) -> None:
+        result: AppConfig | None = await self.push_screen_wait(
+            ProjectScreen(self._update_config_tracks())
+        )
+        if result is None:
+            self.refresh_bindings()
+            return
+
+        self._player.stop()
+        self._player.shutdown()
+        self._config = result
+        self._tracks = list(result.tracks)
+        self._active_idx = 0
+        self.sub_title = result.project_name
+        save_config(self._config)
+
+        from .artnet_timecode import build_player_from_track, build_markers_from_track
+
+        self._player = build_player_from_track(self._tracks[0], self._config)
+        self._markers = build_markers_from_track(self._tracks[0], self._config.fps)
+        self._last_frame = -1
+        self._last_wave_col = -1
+        await self.recompose()
+        self.refresh_bindings()
+        if self._markers:
+            self.query_one("#marker-panel").add_class("visible")
+        self.query_one("#track-list", TrackList).set_tracks(self._tracks, 0)
 
     # ── Transport ─────────────────────────────────────────────────────────────
 
@@ -979,6 +1031,8 @@ class TimecodeApp(App[None]):
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("scrub_fwd", "scrub_back") and isinstance(self.focused, Input):
+            return False
         if action in ("toggle_waveform", "scrub_fwd", "scrub_back"):
             return self._nav_mode == ""
         if action in ("zoom_in", "zoom_out", "pan_left", "pan_right", "reset_zoom"):
@@ -1051,6 +1105,7 @@ class TimecodeApp(App[None]):
                 self.notify(f"Export failed: {exc}", severity="error")
 
         await self.push_screen(ExportMarkersModal(default_path), on_path)
+        self.refresh_bindings()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-play":
@@ -1547,6 +1602,434 @@ class SettingsScreen(ModalScreen):
         err = self.query_one("#validation-error", Static)
         err.update(msg)
         err.add_class("visible")
+
+
+# ── Project modals ────────────────────────────────────────────────────────────
+
+
+class ProjectScreen(ModalScreen):
+    """Lists saved projects; open, new, save, export, import, or delete."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close", priority=True)]
+
+    DEFAULT_CSS = """
+    ProjectScreen {
+        align: center middle;
+    }
+    ProjectScreen > Vertical {
+        width: 60;
+        height: auto;
+        max-height: 90%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    ProjectScreen #proj-title {
+        text-style: bold;
+        height: 2;
+        padding: 0 0 1 0;
+    }
+    ProjectScreen #proj-current {
+        color: $text 60%;
+        height: 1;
+        margin: 0 0 1 0;
+    }
+    ProjectScreen ListView {
+        height: 10;
+        border: solid $primary;
+        margin: 0 0 1 0;
+    }
+    ProjectScreen #proj-empty {
+        color: $text 40%;
+        height: 3;
+        content-align: center middle;
+        margin: 0 0 1 0;
+    }
+    ProjectScreen #proj-buttons {
+        height: auto;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    ProjectScreen #proj-buttons Button {
+        margin: 0 1 0 0;
+        min-width: 10;
+    }
+    ProjectScreen #proj-close-row {
+        height: 3;
+        align: right middle;
+    }
+    ProjectScreen #proj-close-row Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def __init__(self, current_cfg: AppConfig) -> None:
+        super().__init__()
+        self._current_cfg = current_cfg
+        self._names: list[str] = list_projects()
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("◈  Projects", id="proj-title")
+            yield Label(f"Current: {self._current_cfg.project_name}", id="proj-current")
+            if self._names:
+                yield ListView(
+                    *[ListItem(Label(n)) for n in self._names],
+                    id="proj-list",
+                )
+            else:
+                yield Static("No saved projects yet", id="proj-empty")
+            with Horizontal(id="proj-buttons"):
+                yield Button("Open", id="btn-proj-open")
+                yield Button("New", id="btn-proj-new")
+                yield Button("Save", id="btn-proj-save", variant="primary")
+                yield Button("Export", id="btn-proj-export")
+                yield Button("Import", id="btn-proj-import")
+                yield Button("Delete", id="btn-proj-delete", variant="error")
+            with Horizontal(id="proj-close-row"):
+                yield Button("Close", id="btn-proj-close")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _selected_name(self) -> str | None:
+        if not self._names:
+            return None
+        try:
+            lv = self.query_one("#proj-list", ListView)
+            idx = lv.index
+            if idx is not None and 0 <= idx < len(self._names):
+                return self._names[idx]
+        except Exception:
+            pass
+        return None
+
+    def _refresh_list(self) -> None:
+        self._names = list_projects()
+        try:
+            lv = self.query_one("#proj-list", ListView)
+            lv.clear()
+            for n in self._names:
+                lv.append(ListItem(Label(n)))
+        except Exception:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn = event.button.id
+        if btn == "btn-proj-close":
+            self.dismiss(None)
+        elif btn == "btn-proj-open":
+            self._do_open()
+        elif btn == "btn-proj-new":
+            self._do_new()
+        elif btn == "btn-proj-save":
+            self._do_save()
+        elif btn == "btn-proj-export":
+            self._do_export()
+        elif btn == "btn-proj-import":
+            self._do_import()
+        elif btn == "btn-proj-delete":
+            self._do_delete()
+
+    def _do_open(self) -> None:
+        name = self._selected_name()
+        if not name:
+            self.notify("Select a project first", severity="warning")
+            return
+        try:
+            cfg = load_project(name)
+            self.dismiss(cfg)
+        except Exception as exc:
+            self.notify(f"Could not open project: {exc}", severity="error")
+
+    def _do_new(self) -> None:
+        self.app.push_screen(ProjectNameModal(), self._on_new_name)
+
+    def _on_new_name(self, name: str | None) -> None:
+        if not name:
+            return
+        new_cfg = AppConfig(
+            ip=self._current_cfg.ip,
+            port=self._current_cfg.port,
+            broadcast=self._current_cfg.broadcast,
+            fps=self._current_cfg.fps,
+            project_name=name,
+        )
+        new_cfg.tracks = [TrackConfig()]
+        try:
+            save_project(new_cfg)
+            self.dismiss(new_cfg)
+        except Exception as exc:
+            self.notify(f"Could not create project: {exc}", severity="error")
+
+    def _do_save(self) -> None:
+        try:
+            save_project(self._current_cfg)
+            self._refresh_list()
+            self.notify(f"Saved '{self._current_cfg.project_name}'")
+        except Exception as exc:
+            self.notify(f"Save failed: {exc}", severity="error")
+
+    def _do_export(self) -> None:
+        name = self._current_cfg.project_name
+        default = os.path.join(os.path.expanduser("~"), f"{name}.tcp")
+        self.app.push_screen(ExportProjectModal(default), self._on_export_path)
+
+    def _on_export_path(self, path_str: str | None) -> None:
+        if not path_str:
+            return
+        from pathlib import Path as _Path
+
+        try:
+            export_project(self._current_cfg, _Path(path_str))
+            self.notify(f"Exported → {path_str}")
+        except Exception as exc:
+            self.notify(f"Export failed: {exc}", severity="error")
+
+    def _do_import(self) -> None:
+        self.app.push_screen(ImportProjectModal(), self._on_import_paths)
+
+    def _on_import_paths(self, result: tuple[str, str] | None) -> None:
+        if not result:
+            return
+        tcp_str, dir_str = result
+        from pathlib import Path as _Path
+
+        try:
+            cfg = import_project(_Path(tcp_str), _Path(dir_str))
+            save_project(cfg)
+            self.dismiss(cfg)
+        except Exception as exc:
+            self.notify(f"Import failed: {exc}", severity="error")
+
+    def _do_delete(self) -> None:
+        name = self._selected_name()
+        if not name:
+            self.notify("Select a project first", severity="warning")
+            return
+        if name == self._current_cfg.project_name:
+            self.notify("Cannot delete the currently open project", severity="warning")
+            return
+        try:
+            delete_project(name)
+            self._refresh_list()
+            self.notify(f"Deleted '{name}'")
+        except Exception as exc:
+            self.notify(f"Delete failed: {exc}", severity="error")
+
+
+class ProjectNameModal(ModalScreen):
+    """Prompt for a new project name; dismisses with the name string or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    ProjectNameModal {
+        align: center middle;
+    }
+    ProjectNameModal > Vertical {
+        width: 50;
+        height: auto;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    ProjectNameModal #pnm-title {
+        text-style: bold;
+        height: 2;
+    }
+    ProjectNameModal Input {
+        margin: 0 0 1 0;
+    }
+    ProjectNameModal #pnm-buttons {
+        height: 3;
+        align: right middle;
+    }
+    ProjectNameModal #pnm-buttons Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("New Project", id="pnm-title")
+            yield Input(placeholder="Project name", id="inp-proj-name")
+            with Horizontal(id="pnm-buttons"):
+                yield Button("Create", id="btn-create", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+        elif event.button.id == "btn-create":
+            name = self.query_one("#inp-proj-name", Input).value.strip()
+            if name:
+                self.dismiss(name)
+            else:
+                self.query_one("#inp-proj-name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        name = event.value.strip()
+        if name:
+            self.dismiss(name)
+
+
+class ExportProjectModal(ModalScreen):
+    """Prompt for an output .tcp path; dismisses with the path string or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    ExportProjectModal {
+        align: center middle;
+    }
+    ExportProjectModal > Vertical {
+        width: 74;
+        height: auto;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    ExportProjectModal #epm-title {
+        text-style: bold;
+        height: 2;
+    }
+    ExportProjectModal .field-row {
+        height: 3;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    ExportProjectModal .field-label {
+        width: 20;
+        height: 3;
+        content-align: left middle;
+        padding: 1 0;
+    }
+    ExportProjectModal Input { width: 1fr; }
+    ExportProjectModal #epm-buttons {
+        height: 3;
+        align: right middle;
+    }
+    ExportProjectModal #epm-buttons Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def __init__(self, default_path: str) -> None:
+        super().__init__()
+        self._default_path = default_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("↓  Export Project (.tcp)", id="epm-title")
+            with Horizontal(classes="field-row"):
+                yield Label("Output file", classes="field-label")
+                yield Input(value=self._default_path, id="inp-export-path")
+            with Horizontal(id="epm-buttons"):
+                yield Button("Export", id="btn-export", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+        elif event.button.id == "btn-export":
+            path = self.query_one("#inp-export-path", Input).value.strip()
+            self.dismiss(path or None)
+
+
+class ImportProjectModal(ModalScreen):
+    """Prompt for a .tcp bundle path and an extract directory."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    ImportProjectModal {
+        align: center middle;
+    }
+    ImportProjectModal > Vertical {
+        width: 74;
+        height: auto;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    ImportProjectModal #ipm-title {
+        text-style: bold;
+        height: 2;
+    }
+    ImportProjectModal .field-row {
+        height: 3;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    ImportProjectModal .field-label {
+        width: 20;
+        height: 3;
+        content-align: left middle;
+        padding: 1 0;
+    }
+    ImportProjectModal Input { width: 1fr; }
+    ImportProjectModal #ipm-buttons {
+        height: 3;
+        align: right middle;
+    }
+    ImportProjectModal #ipm-buttons Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("↑  Import Project (.tcp)", id="ipm-title")
+            with Horizontal(classes="field-row"):
+                yield Label(".tcp bundle", classes="field-label")
+                yield Input(id="inp-tcp-path", placeholder="/path/to/project.tcp")
+                yield Button("Browse…", id="btn-tcp-browse")
+            with Horizontal(classes="field-row"):
+                yield Label("Extract to", classes="field-label")
+                yield Input(
+                    value=os.path.expanduser("~/Documents"),
+                    id="inp-extract-dir",
+                )
+            with Horizontal(id="ipm-buttons"):
+                yield Button("Import", id="btn-import", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn = event.button.id
+        if btn == "btn-cancel":
+            self.dismiss(None)
+        elif btn == "btn-tcp-browse":
+            start = self.query_one("#inp-tcp-path", Input).value or os.path.expanduser(
+                "~"
+            )
+            self.app.push_screen(FileBrowserModal(start), self._on_tcp_chosen)
+        elif btn == "btn-import":
+            tcp = self.query_one("#inp-tcp-path", Input).value.strip()
+            d = self.query_one("#inp-extract-dir", Input).value.strip()
+            if not tcp:
+                self.notify("Enter a .tcp file path", severity="warning")
+            elif not d:
+                self.notify("Enter an extract directory", severity="warning")
+            else:
+                self.dismiss((tcp, d))
+
+    def _on_tcp_chosen(self, path: str | None) -> None:
+        if path:
+            self.query_one("#inp-tcp-path", Input).value = path
 
 
 # ── File browser modal ─────────────────────────────────────────────────────────
