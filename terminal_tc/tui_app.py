@@ -1493,6 +1493,9 @@ class SettingsScreen(ModalScreen):
                             id="sel-fps",
                             allow_blank=False,
                         )
+                    with Horizontal(classes="field-row"):
+                        yield Label("Reset TC on Stop", classes="field-label")
+                        yield Switch(value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop")
                 with TabPane("Tracks", id="tab-tracks"):
                     yield TrackList(
                         self._working_tracks,
@@ -1582,6 +1585,7 @@ class SettingsScreen(ModalScreen):
                 port=int(port_str) if port_str else 6454,
                 broadcast=self.query_one("#sw-broadcast", Switch).value,
                 fps=float(fps_raw) if fps_raw is not Select.BLANK else 25.0,
+                reset_tc_on_stop=self.query_one("#sw-reset-tc-on-stop", Switch).value,
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")

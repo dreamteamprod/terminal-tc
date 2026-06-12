@@ -261,6 +261,7 @@ class ArtNetTimecodePlayer:
         dest_port: int,
         audio_path: Optional[str] = None,
         broadcast: bool = False,
+        reset_tc_on_stop: bool = True,
     ):
 
         self.start_tc = start_tc
@@ -269,6 +270,7 @@ class ArtNetTimecodePlayer:
         self.dest_port = dest_port
         self.audio_path = audio_path
         self.broadcast = broadcast
+        self.reset_tc_on_stop = reset_tc_on_stop
 
         self.fps_type = FPS_TYPE_MAP.get(fps, 3)
         self._frame_interval = 1.0 / fps
@@ -341,12 +343,16 @@ class ArtNetTimecodePlayer:
             self._audio_error = f"Load error: {e}"
 
     def _audio_thread_fn(self, start_pos: int) -> None:
-        chunk_size = 1024
+        # WSL has a slow/virtualised scheduler — use larger chunks and a high-latency
+        # buffer to prevent ALSA underruns.  Native platforms keep the default.
+        chunk_size = 4096 if _is_wsl() else 1024
+        stream_kwargs = {"latency": "high"} if _is_wsl() else {}
         try:
             with sd.OutputStream(
                 samplerate=self._audio_samplerate,
                 channels=self._audio_channels,
                 dtype="float32",
+                **stream_kwargs,
             ) as stream:
                 data = self._audio_data
                 total = len(data)
@@ -456,8 +462,16 @@ class ArtNetTimecodePlayer:
         self._pause_frame_acc = 0
         self.status_msg = "Stopped"
         self._stop_audio()
-        with self._tc_lock:
-            self._tc = self.start_tc
+        if self.reset_tc_on_stop:
+            with self._tc_lock:
+                self._tc = self.start_tc
+            try:
+                tc = self.start_tc
+                pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
+                self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
+                self.packet_count += 1
+            except Exception:
+                self.error_count += 1
 
     def toggle_play_pause(self) -> None:
         if self.state == State.PLAYING:
@@ -724,6 +738,7 @@ def build_player_from_track(track, cfg: AppConfig) -> "ArtNetTimecodePlayer":
         dest_port=cfg.port,
         audio_path=track.audio,
         broadcast=cfg.broadcast,
+        reset_tc_on_stop=cfg.reset_tc_on_stop,
     )
 
 
