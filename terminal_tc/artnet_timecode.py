@@ -18,12 +18,15 @@ Usage examples:
 
 import argparse
 import dataclasses
+import json
+import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
-import os
 from enum import IntEnum
 from typing import Optional
 
@@ -237,6 +240,86 @@ def load_markers(path: str, fps: float, fmt: str = "auto") -> list:
     return markers
 
 
+# ── Video (mpv) ────────────────────────────────────────────────────────────────
+def _find_mpv() -> Optional[str]:
+    return shutil.which("mpv")
+
+
+class VideoController:
+    """Controls an mpv subprocess via JSON IPC socket for sync video playback."""
+
+    def __init__(self, mpv_cmd: str) -> None:
+        self._mpv_cmd = mpv_cmd
+        self._proc: Optional[subprocess.Popen] = None
+        self._sock_path = f"/tmp/artnet-tc-video-{os.getpid()}.sock"
+
+    def launch(self, video_path: str, start_seconds: float) -> None:
+        """Start mpv at start_seconds, non-blocking. Unpauses once IPC socket is ready."""
+        self._kill()
+        cmd = [
+            self._mpv_cmd,
+            f"--input-ipc-server={self._sock_path}",
+            f"--start={start_seconds:.3f}",
+            "--pause",
+            "--no-terminal",
+            "--keep-open=yes",
+            "--force-window=yes",
+            video_path,
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        threading.Thread(target=self._unpause_when_ready, daemon=True).start()
+
+    def _unpause_when_ready(self) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if os.path.exists(self._sock_path):
+                time.sleep(0.02)
+                self._ipc(["set_property", "pause", False])
+                return
+            time.sleep(0.05)
+
+    def _ipc(self, command: list) -> None:
+        if not os.path.exists(self._sock_path):
+            return
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                s.connect(self._sock_path)
+                s.sendall((json.dumps({"command": command}) + "\n").encode())
+        except Exception:
+            pass
+
+    def pause(self) -> None:
+        self._ipc(["set_property", "pause", True])
+
+    def resume(self) -> None:
+        self._ipc(["set_property", "pause", False])
+
+    def seek(self, abs_seconds: float) -> None:
+        self._ipc(["seek", abs_seconds, "absolute"])
+
+    def stop(self) -> None:
+        self._kill()
+
+    def _kill(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+        try:
+            os.unlink(self._sock_path)
+        except OSError:
+            pass
+
+
 # ── State ──────────────────────────────────────────────────────────────────────
 class State(IntEnum):
     STOPPED = 0
@@ -262,6 +345,8 @@ class ArtNetTimecodePlayer:
         audio_path: Optional[str] = None,
         broadcast: bool = False,
         reset_tc_on_stop: bool = True,
+        video_path: Optional[str] = None,
+        video_offset: float = 0.0,
     ):
 
         self.start_tc = start_tc
@@ -306,6 +391,18 @@ class ArtNetTimecodePlayer:
 
         if audio_path:
             self._load_audio(audio_path)
+
+        # Video
+        self._video_path = video_path
+        self._video_offset = video_offset
+        self._video_error: str = ""
+        self._video_ctrl: Optional[VideoController] = None
+        if video_path:
+            mpv_cmd = _find_mpv()
+            if mpv_cmd:
+                self._video_ctrl = VideoController(mpv_cmd)
+            else:
+                self._video_error = "mpv not found — install mpv for video playback"
 
     # ── Audio ──────────────────────────────────────────────────────────────────
     def _load_audio(self, path: str) -> None:
@@ -441,6 +538,11 @@ class ArtNetTimecodePlayer:
             )
             self._start_audio_at(audio_offset)
 
+        # Start video at matching offset
+        if self._video_ctrl and self._video_path:
+            video_pos = self._video_offset + self._pause_frame_acc / self.fps
+            self._video_ctrl.launch(self._video_path, video_pos)
+
         self._ticker_thread = threading.Thread(target=self._ticker, daemon=True)
         self._ticker_thread.start()
 
@@ -453,6 +555,8 @@ class ArtNetTimecodePlayer:
         self.state = State.PAUSED
         self.status_msg = "Paused"
         self._stop_audio()
+        if self._video_ctrl:
+            self._video_ctrl.pause()
 
     def stop(self) -> None:
         if self.state == State.STOPPED:
@@ -462,6 +566,8 @@ class ArtNetTimecodePlayer:
         self._pause_frame_acc = 0
         self.status_msg = "Stopped"
         self._stop_audio()
+        if self._video_ctrl:
+            self._video_ctrl.stop()
         if self.reset_tc_on_stop:
             with self._tc_lock:
                 self._tc = self.start_tc
@@ -513,6 +619,10 @@ class ArtNetTimecodePlayer:
         elif self.state == State.PAUSED:
             self._pause_frame_acc = max(0, self._pause_frame_acc + delta_frames)
             self._emit_tc_at_acc()
+            if self._video_ctrl:
+                self._video_ctrl.seek(
+                    self._video_offset + self._pause_frame_acc / self.fps
+                )
 
         else:  # STOPPED → transition to PAUSED at scrubbed position
             self._pause_frame_acc = max(0, delta_frames)
@@ -552,6 +662,10 @@ class ArtNetTimecodePlayer:
 
         if was_playing:
             self.play()
+        elif self._video_ctrl:
+            self._video_ctrl.seek(
+                self._video_offset + self._pause_frame_acc / self.fps
+            )
 
     def shutdown(self) -> None:
         self._stop_event.set()
@@ -559,6 +673,8 @@ class ArtNetTimecodePlayer:
             self._ticker_thread.join(timeout=0.5)
         if self._audio_thread_hdl is not None:
             self._audio_thread_hdl.join(timeout=1.0)
+        if self._video_ctrl:
+            self._video_ctrl.stop()
         try:
             self._sock.close()
         except Exception:
@@ -739,6 +855,8 @@ def build_player_from_track(track, cfg: AppConfig) -> "ArtNetTimecodePlayer":
         audio_path=track.audio,
         broadcast=cfg.broadcast,
         reset_tc_on_stop=cfg.reset_tc_on_stop,
+        video_path=track.video,
+        video_offset=track.video_offset,
     )
 
 

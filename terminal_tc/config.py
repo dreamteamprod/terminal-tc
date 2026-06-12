@@ -63,6 +63,8 @@ class TrackConfig:
     start_seconds: int = 0
     start_frames: int = 0
     markers_absolute: bool = True
+    video: Optional[str] = None
+    video_offset: float = 0.0
 
 
 @dataclasses.dataclass
@@ -182,4 +184,8 @@ def validate_track_config(
             errs.append(f"Audio file not found: {track.audio}")
         if track.markers and not os.path.isfile(track.markers):
             errs.append(f"Markers file not found: {track.markers}")
+        if track.video and not os.path.isfile(track.video):
+            errs.append(f"Video file not found: {track.video}")
+    if track.video_offset < 0:
+        errs.append("Video offset must be >= 0")
     return errs

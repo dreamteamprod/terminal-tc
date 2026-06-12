@@ -493,7 +493,7 @@ class TrackList(Widget):
 
         h = max(1, self.size.height - 1)  # reserve header row
         out = Text()
-        out.append("  #  NAME                   START TC      ♪  ≡\n", style="bold dim")
+        out.append("  #  NAME                   START TC      ♪  ▶  ≡\n", style="bold dim")
 
         for i in range(self._scroll, min(self._scroll + h, len(self._tracks))):
             t = self._tracks[i]
@@ -505,6 +505,7 @@ class TrackList(Widget):
             name = t.name[:21].ljust(21)
             tc_str = f"{t.start_hours:02d}:{t.start_minutes:02d}:{t.start_seconds:02d}:{t.start_frames:02d}"
             audio_icon = "♪" if (t.audio and os.path.isfile(t.audio)) else "—"
+            video_icon = "▶" if (t.video and os.path.isfile(t.video)) else "—"
             marker_icon = "≡" if (t.markers and os.path.isfile(t.markers)) else "—"
 
             if is_cursor and is_active:
@@ -517,7 +518,7 @@ class TrackList(Widget):
                 style = "dim"
 
             out.append(
-                f"{active_dot}{arrow} {i + 1:<2} {name}  {tc_str}  {audio_icon}  {marker_icon}\n",
+                f"{active_dot}{arrow} {i + 1:<2} {name}  {tc_str}  {audio_icon}  {video_icon}  {marker_icon}\n",
                 style=style,
             )
         return out
@@ -747,13 +748,15 @@ class TimecodeApp(App[None]):
         dest += f":{c.port}"
         fps_label = _FPS_LABEL.get(c.fps, f"{c.fps} fps")
         audio = self._audio_status()
+        video = self._video_status()
         name = track.name if track else "—"
         return (
             f"Track:        {name}\n"
             f"Destination:  {dest}\n"
             f"Frame rate:   {fps_label}\n"
             f"Start TC:     {p.start_tc}\n"
-            f"Audio:        {audio}"
+            f"Audio:        {audio}\n"
+            f"Video:        {video}"
         )
 
     def _audio_status(self) -> str:
@@ -768,12 +771,25 @@ class TimecodeApp(App[None]):
             return f"✓  {os.path.basename(track.audio)}  ({dur} @ {p._audio_samplerate} Hz)"
         return "Loading…"
 
+    def _video_status(self) -> str:
+        p = self._player
+        track = self._active_track()
+        if not track or not track.video:
+            return "—  none"
+        if p._video_error:
+            return f"✗  {p._video_error}"
+        if p._video_ctrl:
+            offset_str = f"+{track.video_offset:.1f}s" if track.video_offset else "start"
+            return f"✓  {os.path.basename(track.video)}  (offset {offset_str})"
+        return "—  none"
+
     def on_mount(self) -> None:
         if self._markers:
             self.query_one("#marker-panel").add_class("visible")
         self._last_frame: int = -1
         self._last_wave_col: int = -1
         self.set_interval(1 / 30, self._poll)
+        self.call_after_refresh(self._notify_video_error)
 
     def _poll(self) -> None:
         try:
@@ -826,6 +842,10 @@ class TimecodeApp(App[None]):
 
     # ── Track management ──────────────────────────────────────────────────────
 
+    def _notify_video_error(self) -> None:
+        if self._player._video_error:
+            self.notify(self._player._video_error, severity="warning")
+
     def _update_config_tracks(self) -> AppConfig:
         return dataclasses.replace(self._config, tracks=list(self._tracks))
 
@@ -844,6 +864,7 @@ class TimecodeApp(App[None]):
 
         track = self._tracks[idx]
         self._player = build_player_from_track(track, self._config)
+        self._notify_video_error()
         self._markers = build_markers_from_track(track, self._config.fps)
         self._active_idx = idx
         self._last_frame = -1
@@ -945,6 +966,7 @@ class TimecodeApp(App[None]):
         self._player = build_player_from_track(
             self._tracks[self._active_idx], new_config
         )
+        self._notify_video_error()
         self._markers = build_markers_from_track(
             self._tracks[self._active_idx], new_config.fps
         )
@@ -984,6 +1006,7 @@ class TimecodeApp(App[None]):
         from .artnet_timecode import build_player_from_track, build_markers_from_track
 
         self._player = build_player_from_track(self._tracks[0], self._config)
+        self._notify_video_error()
         self._markers = build_markers_from_track(self._tracks[0], self._config.fps)
         self._last_frame = -1
         self._last_wave_col = -1
@@ -1245,6 +1268,22 @@ class TrackEditModal(ModalScreen):
                     id="sel-markers-absolute",
                     allow_blank=False,
                 )
+            with Horizontal(classes="field-row"):
+                yield Label("Video File", classes="field-label")
+                yield Input(
+                    value=t.video or "",
+                    id="inp-video",
+                    placeholder="path/to/video.mp4",
+                )
+                yield Button("Browse…", id="btn-video-browse")
+            with Horizontal(classes="field-row"):
+                yield Label("Video Offset (s)", classes="field-label")
+                yield Input(
+                    value=str(t.video_offset),
+                    id="inp-video-offset",
+                    type="number",
+                    placeholder="0.0",
+                )
             yield Static("", id="validation-error")
             with Horizontal(id="modal-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
@@ -1267,6 +1306,9 @@ class TrackEditModal(ModalScreen):
                 "~"
             )
             self.app.push_screen(FileBrowserModal(start), self._on_markers_chosen)
+        elif btn == "btn-video-browse":
+            start = self.query_one("#inp-video", Input).value or os.path.expanduser("~")
+            self.app.push_screen(FileBrowserModal(start), self._on_video_chosen)
 
     def _on_audio_chosen(self, path: str | None) -> None:
         if path:
@@ -1276,10 +1318,15 @@ class TrackEditModal(ModalScreen):
         if path:
             self.query_one("#inp-markers", Input).value = path
 
+    def _on_video_chosen(self, path: str | None) -> None:
+        if path:
+            self.query_one("#inp-video", Input).value = path
+
     def _try_save(self) -> None:
         try:
             fmt_raw = self.query_one("#sel-marker-format", Select).value
             abs_raw = self.query_one("#sel-markers-absolute", Select).value
+            video_offset_raw = self.query_one("#inp-video-offset", Input).value or "0"
             track = TrackConfig(
                 name=self.query_one("#inp-name", Input).value.strip(),
                 start_hours=int(self.query_one("#inp-hours", Input).value or "0"),
@@ -1290,6 +1337,8 @@ class TrackEditModal(ModalScreen):
                 markers=self.query_one("#inp-markers", Input).value.strip() or None,
                 marker_format=str(fmt_raw) if fmt_raw is not Select.BLANK else "auto",
                 markers_absolute=abs_raw != "relative",
+                video=self.query_one("#inp-video", Input).value.strip() or None,
+                video_offset=float(video_offset_raw),
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
