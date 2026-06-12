@@ -1097,7 +1097,7 @@ class TimecodeApp(App[None]):
             try:
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    writer.writerow(["id", "name", "timecode"])
+                    writer.writerow(["#", "Name", "Start"])
                     for mid, name, tc in self._markers:
                         writer.writerow([mid, name, str(tc)])
                 self.notify(f"Exported {len(self._markers)} markers → {path}")
