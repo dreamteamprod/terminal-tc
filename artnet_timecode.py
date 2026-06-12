@@ -36,6 +36,7 @@ try:
     import sounddevice as sd
     import soundfile as sf
     import numpy as np
+
     AUDIO_AVAILABLE = True
 except ImportError:
     AUDIO_AVAILABLE = False
@@ -44,29 +45,30 @@ except OSError:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ARTNET_PORT = 6454
-ARTNET_ID   = b"Art-Net\x00"
-OP_TIMECODE = 0x9700          # ArtTimeCode opcode
+ARTNET_ID = b"Art-Net\x00"
+OP_TIMECODE = 0x9700  # ArtTimeCode opcode
 
 SUPPORTED_FPS = [24, 25, 29.97, 30]
 
-FPS_TYPE_MAP = {             # Art-Net type field values
-    24:    0,
-    25:    1,
+FPS_TYPE_MAP = {  # Art-Net type field values
+    24: 0,
+    25: 1,
     29.97: 2,
-    30:    3,
+    30: 3,
 }
 
 FPS_LABEL = {
-    24:    "24 fps  (Film / DCI)",
-    25:    "25 fps  (EBU / PAL)",
+    24: "24 fps  (Film / DCI)",
+    25: "25 fps  (EBU / PAL)",
     29.97: "29.97 fps  (Drop Frame / NTSC)",
-    30:    "30 fps  (SMPTE / HD)",
+    30: "30 fps  (SMPTE / HD)",
 }
 
 
 # ── Art-Net packet builder ─────────────────────────────────────────────────────
-def build_artimecode(hours: int, minutes: int, seconds: int,
-                     frames: int, fps_type: int) -> bytes:
+def build_artimecode(
+    hours: int, minutes: int, seconds: int, frames: int, fps_type: int
+) -> bytes:
     """
     Build an ArtTimeCode UDP datagram.
 
@@ -87,9 +89,7 @@ def build_artimecode(hours: int, minutes: int, seconds: int,
         + struct.pack("<H", OP_TIMECODE)
         + struct.pack(">H", 14)
         + b"\x00\x00"
-        + struct.pack("BBBBBB",
-                      frames, seconds, minutes, hours,
-                      fps_type, 0)
+        + struct.pack("BBBBBB", frames, seconds, minutes, hours, fps_type, 0)
     )
 
 
@@ -102,15 +102,16 @@ def build_artimecode(hours: int, minutes: int, seconds: int,
 
 # fps argument the library accepts as a string
 _FPS_STR = {
-    24:    "24",
-    25:    "25",
+    24: "24",
+    25: "25",
     29.97: "29.97",
-    30:    "30",
+    30: "30",
 }
 
 
-def make_tc(fps: float, hours: int, minutes: int,
-            seconds: int, frames: int) -> _LibTimecode:
+def make_tc(
+    fps: float, hours: int, minutes: int, seconds: int, frames: int
+) -> _LibTimecode:
     """Construct a Timecode from H/M/S/F components."""
     sep = ";" if fps == 29.97 else ":"
     tc_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}{sep}{frames:02d}"
@@ -129,11 +130,12 @@ def load_markers(path: str, fps: float) -> list:
     The header row (first field == '#') is skipped. Malformed rows are ignored.
     """
     import csv
+
     markers = []
     try:
-        with open(path, newline='', encoding='utf-8') as f:
+        with open(path, newline="", encoding="utf-8") as f:
             for row in csv.reader(f):
-                if len(row) < 3 or row[0].strip() == '#':
+                if len(row) < 3 or row[0].strip() == "#":
                     continue
                 mid, name, tc_str = row[0].strip(), row[1].strip(), row[2].strip()
                 try:
@@ -151,48 +153,51 @@ def load_markers(path: str, fps: float) -> list:
 class State(IntEnum):
     STOPPED = 0
     PLAYING = 1
-    PAUSED  = 2
+    PAUSED = 2
+
 
 STATE_STYLE = {
-    State.STOPPED: ("red",    "■  STOPPED"),
-    State.PLAYING: ("green",  "▶  PLAYING"),
-    State.PAUSED:  ("yellow", "⏸  PAUSED"),
+    State.STOPPED: ("red", "■  STOPPED"),
+    State.PLAYING: ("green", "▶  PLAYING"),
+    State.PAUSED: ("yellow", "⏸  PAUSED"),
 }
 
 
 # ── Player ─────────────────────────────────────────────────────────────────────
 class ArtNetTimecodePlayer:
-    def __init__(self,
-                 start_tc:   _LibTimecode,
-                 fps:        float,
-                 dest_ip:    str,
-                 dest_port:  int,
-                 audio_path: Optional[str] = None,
-                 broadcast:  bool = False):
+    def __init__(
+        self,
+        start_tc: _LibTimecode,
+        fps: float,
+        dest_ip: str,
+        dest_port: int,
+        audio_path: Optional[str] = None,
+        broadcast: bool = False,
+    ):
 
-        self.start_tc   = start_tc
-        self.fps        = fps
-        self.dest_ip    = dest_ip
-        self.dest_port  = dest_port
+        self.start_tc = start_tc
+        self.fps = fps
+        self.dest_ip = dest_ip
+        self.dest_port = dest_port
         self.audio_path = audio_path
-        self.broadcast  = broadcast
+        self.broadcast = broadcast
 
-        self.fps_type        = FPS_TYPE_MAP.get(fps, 3)
+        self.fps_type = FPS_TYPE_MAP.get(fps, 3)
         self._frame_interval = 1.0 / fps
-        self.state           = State.STOPPED
-        self.packet_count    = 0
-        self.error_count     = 0
-        self.status_msg      = "Ready"
+        self.state = State.STOPPED
+        self.packet_count = 0
+        self.error_count = 0
+        self.status_msg = "Ready"
 
         # Current displayed timecode
         self._tc_lock = threading.Lock()
         self._tc: _LibTimecode = start_tc
 
         # Pause/resume state tracking
-        self._play_start_wall:  float = 0.0
-        self._pause_frame_acc:  int   = 0   # frames already elapsed before pause
+        self._play_start_wall: float = 0.0
+        self._pause_frame_acc: int = 0  # frames already elapsed before pause
 
-        self._stop_event    = threading.Event()
+        self._stop_event = threading.Event()
         self._ticker_thread: Optional[threading.Thread] = None
 
         # UDP socket
@@ -201,13 +206,13 @@ class ArtNetTimecodePlayer:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         # Audio
-        self._audio_data:        Optional[np.ndarray]    = None
-        self._audio_samplerate:  int                     = 44100
-        self._audio_thread_hdl:  Optional[threading.Thread] = None
-        self._audio_pos:         int                     = 0
-        self._audio_loaded:      bool                    = False
-        self._audio_error:       str                     = ""
-        self._audio_channels:    int                     = 2
+        self._audio_data: Optional[np.ndarray] = None
+        self._audio_samplerate: int = 44100
+        self._audio_thread_hdl: Optional[threading.Thread] = None
+        self._audio_pos: int = 0
+        self._audio_loaded: bool = False
+        self._audio_error: str = ""
+        self._audio_channels: int = 2
 
         if audio_path:
             self._load_audio(audio_path)
@@ -222,10 +227,10 @@ class ArtNetTimecodePlayer:
             return
         try:
             data, sr = sf.read(path, dtype="float32", always_2d=True)
-            self._audio_data       = data
+            self._audio_data = data
             self._audio_samplerate = sr
-            self._audio_channels   = data.shape[1]
-            self._audio_loaded     = True
+            self._audio_channels = data.shape[1]
+            self._audio_loaded = True
         except Exception as e:
             self._audio_error = f"Load error: {e}"
 
@@ -237,12 +242,12 @@ class ArtNetTimecodePlayer:
                 channels=self._audio_channels,
                 dtype="float32",
             ) as stream:
-                data  = self._audio_data
+                data = self._audio_data
                 total = len(data)
-                pos   = start_pos
+                pos = start_pos
                 while not self._stop_event.is_set() and pos < total:
-                    chunk = data[pos:pos + chunk_size]
-                    stream.write(chunk)   # blocks in C, GIL released during wait
+                    chunk = data[pos : pos + chunk_size]
+                    stream.write(chunk)  # blocks in C, GIL released during wait
                     pos += chunk_size
                 self._audio_pos = pos
         except Exception as e:
@@ -271,11 +276,11 @@ class ArtNetTimecodePlayer:
         High-accuracy frame ticker.
         Uses absolute time anchoring to avoid drift accumulation.
         """
-        interval       = self._frame_interval
-        wall_origin    = self._play_start_wall
-        start_fn       = self.start_tc.frame_number + self._pause_frame_acc
-        next_tick      = wall_origin
-        local_fn       = start_fn
+        interval = self._frame_interval
+        wall_origin = self._play_start_wall
+        start_fn = self.start_tc.frame_number + self._pause_frame_acc
+        next_tick = wall_origin
+        local_fn = start_fn
 
         while not self._stop_event.is_set():
             # Sleep until the next frame deadline
@@ -294,16 +299,14 @@ class ArtNetTimecodePlayer:
                 self._tc = tc
 
             try:
-                pkt = build_artimecode(
-                    tc.hrs, tc.mins, tc.secs, tc.frs,
-                    self.fps_type)
+                pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
                 self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
                 self.packet_count += 1
             except Exception:
                 self.error_count += 1
 
-            local_fn  += 1
-            next_tick  = wall_origin + (local_fn - start_fn) * interval
+            local_fn += 1
+            next_tick = wall_origin + (local_fn - start_fn) * interval
 
     # ── Transport ──────────────────────────────────────────────────────────────
     def play(self) -> None:
@@ -322,11 +325,11 @@ class ArtNetTimecodePlayer:
         # Start audio at matching offset
         if self._audio_loaded:
             audio_offset = round(
-                (self._pause_frame_acc / self.fps) * self._audio_samplerate)
+                (self._pause_frame_acc / self.fps) * self._audio_samplerate
+            )
             self._start_audio_at(audio_offset)
 
-        self._ticker_thread = threading.Thread(
-            target=self._ticker, daemon=True)
+        self._ticker_thread = threading.Thread(target=self._ticker, daemon=True)
         self._ticker_thread.start()
 
     def pause(self) -> None:
@@ -378,7 +381,7 @@ class ArtNetTimecodePlayer:
             # pause() sets _stop_event; joining ensures play()'s _stop_event.clear()
             # doesn't race with old threads that haven't exited yet.
             old_ticker = self._ticker_thread
-            old_audio  = self._audio_thread_hdl
+            old_audio = self._audio_thread_hdl
             self.pause()
             if old_ticker is not None:
                 old_ticker.join(timeout=0.2)
@@ -393,7 +396,7 @@ class ArtNetTimecodePlayer:
 
         else:  # STOPPED → transition to PAUSED at scrubbed position
             self._pause_frame_acc = max(0, delta_frames)
-            self.state      = State.PAUSED
+            self.state = State.PAUSED
             self.status_msg = "Paused"
             self._emit_tc_at_acc()
 
@@ -410,16 +413,18 @@ class ArtNetTimecodePlayer:
 
     def seek_to_frame(self, abs_frame: int) -> None:
         """Jump to an absolute frame position (clamps to >= start_tc)."""
-        was_playing = (self.state == State.PLAYING)
+        was_playing = self.state == State.PLAYING
 
         if was_playing:
             old_ticker = self._ticker_thread
-            old_audio  = self._audio_thread_hdl
+            old_audio = self._audio_thread_hdl
             self.pause()
-            if old_ticker is not None: old_ticker.join(timeout=0.2)
-            if old_audio  is not None: old_audio.join(timeout=0.2)
+            if old_ticker is not None:
+                old_ticker.join(timeout=0.2)
+            if old_audio is not None:
+                old_audio.join(timeout=0.2)
         elif self.state == State.STOPPED:
-            self.state      = State.PAUSED
+            self.state = State.PAUSED
             self.status_msg = "Paused"
 
         self._pause_frame_acc = max(0, abs_frame - self.start_tc.frame_number)
@@ -438,7 +443,6 @@ class ArtNetTimecodePlayer:
             self._sock.close()
         except Exception:
             pass
-
 
 
 def _is_interactive() -> bool:
@@ -467,35 +471,75 @@ Examples:
 
   # Unicast to a single node
   python artnet_timecode.py --ip 192.168.1.42 --fps 25
-        """)
+        """,
+    )
 
     net = parser.add_argument_group("Network")
-    net.add_argument("--ip",    default="2.255.255.255",
-                     metavar="ADDR",
-                     help="Destination IP (default: 2.255.255.255)")
-    net.add_argument("--port",  type=int, default=ARTNET_PORT,
-                     metavar="PORT",
-                     help=f"UDP port (default: {ARTNET_PORT})")
-    net.add_argument("--broadcast", action="store_true",
-                     help="Force SO_BROADCAST on the socket")
+    net.add_argument(
+        "--ip",
+        default="2.255.255.255",
+        metavar="ADDR",
+        help="Destination IP (default: 2.255.255.255)",
+    )
+    net.add_argument(
+        "--port",
+        type=int,
+        default=ARTNET_PORT,
+        metavar="PORT",
+        help=f"UDP port (default: {ARTNET_PORT})",
+    )
+    net.add_argument(
+        "--broadcast", action="store_true", help="Force SO_BROADCAST on the socket"
+    )
 
     tc_g = parser.add_argument_group("Timecode")
-    tc_g.add_argument("--fps", type=float, default=25.0,
-                      choices=SUPPORTED_FPS, metavar="FPS",
-                      help="Frame rate: 24 | 25 | 29.97 | 30  (default: 25)")
-    tc_g.add_argument("--start-hours",   type=int, default=0, metavar="HH",
-                      help="Start timecode hours   (default: 0)")
-    tc_g.add_argument("--start-minutes", type=int, default=0, metavar="MM",
-                      help="Start timecode minutes (default: 0)")
-    tc_g.add_argument("--start-seconds", type=int, default=0, metavar="SS",
-                      help="Start timecode seconds (default: 0)")
-    tc_g.add_argument("--start-frames",  type=int, default=0, metavar="FF",
-                      help="Start timecode frames  (default: 0)")
+    tc_g.add_argument(
+        "--fps",
+        type=float,
+        default=25.0,
+        choices=SUPPORTED_FPS,
+        metavar="FPS",
+        help="Frame rate: 24 | 25 | 29.97 | 30  (default: 25)",
+    )
+    tc_g.add_argument(
+        "--start-hours",
+        type=int,
+        default=0,
+        metavar="HH",
+        help="Start timecode hours   (default: 0)",
+    )
+    tc_g.add_argument(
+        "--start-minutes",
+        type=int,
+        default=0,
+        metavar="MM",
+        help="Start timecode minutes (default: 0)",
+    )
+    tc_g.add_argument(
+        "--start-seconds",
+        type=int,
+        default=0,
+        metavar="SS",
+        help="Start timecode seconds (default: 0)",
+    )
+    tc_g.add_argument(
+        "--start-frames",
+        type=int,
+        default=0,
+        metavar="FF",
+        help="Start timecode frames  (default: 0)",
+    )
 
-    parser.add_argument("--audio", metavar="FILE",
-                        help="Audio file to play in sync (WAV, FLAC, OGG, AIFF…)")
-    parser.add_argument("--markers", metavar="FILE",
-                        help="CSV file of timecode markers (columns: #, Name, Start TC)")
+    parser.add_argument(
+        "--audio",
+        metavar="FILE",
+        help="Audio file to play in sync (WAV, FLAC, OGG, AIFF…)",
+    )
+    parser.add_argument(
+        "--markers",
+        metavar="FILE",
+        help="CSV file of timecode markers (columns: #, Name, Start TC)",
+    )
 
     return parser.parse_args()
 
@@ -504,7 +548,7 @@ def validate_args(args: argparse.Namespace) -> None:
     errs = []
     if args.fps not in SUPPORTED_FPS:
         errs.append(f"--fps must be one of {SUPPORTED_FPS}")
-    if not (0 <= args.start_hours   <= 23):
+    if not (0 <= args.start_hours <= 23):
         errs.append("--start-hours must be 0–23")
     if not (0 <= args.start_minutes <= 59):
         errs.append("--start-minutes must be 0–59")
@@ -531,20 +575,20 @@ def main() -> None:
         args.broadcast = True
 
     start_tc = make_tc(
-        fps     = args.fps,
-        hours   = args.start_hours,
-        minutes = args.start_minutes,
-        seconds = args.start_seconds,
-        frames  = args.start_frames,
+        fps=args.fps,
+        hours=args.start_hours,
+        minutes=args.start_minutes,
+        seconds=args.start_seconds,
+        frames=args.start_frames,
     )
 
     player = ArtNetTimecodePlayer(
-        start_tc   = start_tc,
-        fps        = args.fps,
-        dest_ip    = args.ip,
-        dest_port  = args.port,
-        audio_path = args.audio,
-        broadcast  = args.broadcast,
+        start_tc=start_tc,
+        fps=args.fps,
+        dest_ip=args.ip,
+        dest_port=args.port,
+        audio_path=args.audio,
+        broadcast=args.broadcast,
     )
 
     # ── Non-interactive fallback (piped stdin / CI) ────────────────────────────
@@ -569,6 +613,7 @@ def main() -> None:
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
     from tui_app import TimecodeApp
+
     TimecodeApp(player, args, markers=markers).run()
     print(f"\nStopped. {player.packet_count:,} Art-Net packets sent.\n")
 

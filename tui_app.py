@@ -7,9 +7,11 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+import numpy as np
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Button, Digits, Footer, Header, Label, Static
@@ -18,13 +20,15 @@ from textual.widget import Widget
 if TYPE_CHECKING:
     from artnet_timecode import ArtNetTimecodePlayer
 
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
 _STATE_CLASS = {0: "stopped", 1: "playing", 2: "paused"}
 _STATE_LABEL = {0: "■  STOPPED", 1: "▶  PLAYING", 2: "⏸  PAUSED"}
 _FPS_LABEL = {
-    24:    "24 fps  (Film / DCI)",
-    25:    "25 fps  (EBU / PAL)",
+    24: "24 fps  (Film / DCI)",
+    25: "25 fps  (EBU / PAL)",
     29.97: "29.97 fps  (Drop Frame / NTSC)",
-    30:    "30 fps  (SMPTE / HD)",
+    30: "30 fps  (SMPTE / HD)",
 }
 
 
@@ -99,10 +103,12 @@ class MarkerList(Widget):
         lines: list[Text] = []
         for i in range(self._scroll, min(self._scroll + h, len(self._markers))):
             mid, name, tc = self._markers[i]
-            sel = (i == self.cursor)
+            sel = i == self.cursor
             arrow = "▶ " if sel else "  "
             style = "bold green" if sel else "dim"
-            lines.append(Text(f"{arrow}{mid[:4]:<4}  {name[:20]:<20}  {tc}", style=style))
+            lines.append(
+                Text(f"{arrow}{mid[:4]:<4}  {name[:20]:<20}  {tc}", style=style)
+            )
         while len(lines) < h:
             lines.append(Text(""))
         out = Text()
@@ -157,21 +163,152 @@ class MarkerList(Widget):
             self.set_cursor(row)
 
 
+class WaveformWidget(Widget):
+    """Audio waveform with a scrolling playhead and marker lines."""
+
+    DEFAULT_CSS = """
+    WaveformWidget {
+        height: 10;
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+    """
+
+    _playhead_frac: reactive[float] = reactive(0.0, repaint=True)
+
+    def __init__(self, player: "ArtNetTimecodePlayer", markers: list, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._player = player
+        self._markers = markers
+        self._envelope: "np.ndarray | None" = None
+        self._audio_duration_secs: float = 0.0
+
+    def on_mount(self) -> None:
+        p = self._player
+        if not p._audio_loaded or p._audio_data is None:
+            return
+        mono = np.abs(p._audio_data.mean(axis=1))
+        N = len(mono)
+        HIRES = 2000
+        trim = (N // HIRES) * HIRES
+        envelope = mono[:trim].reshape(HIRES, -1).max(axis=1) if trim > 0 else mono
+        peak = float(envelope.max())
+        self._envelope = (
+            (envelope / peak).astype(np.float32)
+            if peak > 0
+            else envelope.astype(np.float32)
+        )
+        self._audio_duration_secs = N / p._audio_samplerate
+
+    def render(self) -> Text:
+        if self._envelope is None:
+            return Text("  No audio loaded", style="dim italic")
+
+        W = max(1, self.size.width)
+        H = max(1, self.size.height)
+
+        env = self._envelope
+        n = len(env)
+        if n >= W:
+            starts = np.arange(W) * n // W
+            cols = np.maximum.reduceat(env, starts)[:W]
+        else:
+            cols = np.interp(np.arange(W), np.linspace(0, W - 1, n), env).astype(
+                np.float32
+            )
+
+        ph_col = int(self._playhead_frac * (W - 1))
+
+        marker_cols: set[int] = set()
+        if self._audio_duration_secs > 0:
+            p = self._player
+            start_fn = p.start_tc.frame_number
+            total_frames = self._audio_duration_secs * p.fps
+            for _, _, tc in self._markers:
+                frac = (tc.frame_number - start_fn) / total_frames
+                if 0.0 <= frac <= 1.0:
+                    marker_cols.add(int(frac * (W - 1)))
+
+        # Half-block rendering: each terminal row = 2 vertical "half-rows",
+        # giving 2x vertical resolution using ▀ / ▄ / █.
+        center_hr = H - 0.5  # centre of the widget in half-row units
+        fill_radii = cols * center_hr  # per-column fill radius (broadcast-ready)
+
+        out = Text()
+        for row in range(H):
+            if row > 0:
+                out.append("\n")
+            upper_dist = abs(2 * row - center_hr)
+            lower_dist = abs(2 * row + 1 - center_hr)
+            upper_filled = upper_dist <= fill_radii  # shape (W,) bool
+            lower_filled = lower_dist <= fill_radii
+
+            for x in range(W):
+                u = bool(upper_filled[x])
+                lo = bool(lower_filled[x])
+                char = "█" if (u and lo) else ("▀" if u else ("▄" if lo else " "))
+
+                if x == ph_col:
+                    out.append("│", style="bold bright_white")
+                elif x in marker_cols:
+                    out.append("│", style="bold bright_yellow")
+                elif u or lo:
+                    out.append(char, style="green dim")
+                else:
+                    out.append(" ")
+        return out
+
+
+class TimecodeCommands(Provider):
+    """Command palette entries for all player actions."""
+
+    _COMMANDS = [
+        ("Play / Pause", "Toggle playback", "action_toggle_play"),
+        ("Stop", "Stop playback and reset", "action_stop"),
+        ("Scrub Forward", "Jump forward 5 seconds", "action_scrub_fwd"),
+        ("Scrub Back", "Jump back 5 seconds", "action_scrub_back"),
+        ("Previous Marker", "Go to previous cue marker", "action_prev_marker"),
+        ("Next Marker", "Go to next cue marker", "action_next_marker"),
+        ("Jump to Marker", "Seek to selected marker", "action_jump_marker"),
+        ("Toggle Waveform", "Show or hide waveform", "action_toggle_waveform"),
+        ("Quit", "Exit the application", "action_quit"),
+    ]
+
+    async def discover(self) -> Hits:
+        for name, help_text, action in self._COMMANDS:
+            yield Hit(1.0, name, getattr(self.app, action), help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, action in self._COMMANDS:
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(name),
+                    getattr(self.app, action),
+                    text=name,
+                    help=help_text,
+                )
+
+
 class TimecodeApp(App[None]):
     """Art-Net Timecode Player — Textual interface."""
 
     TITLE = "Art-Net Timecode Player"
+    COMMANDS = App.COMMANDS | {TimecodeCommands}
 
     BINDINGS = [
-        Binding("space",  "toggle_play",  "Play/Pause", priority=True),
-        Binding("s",      "stop",         "Stop",       priority=True),
-        Binding("right",  "scrub_fwd",    "Scrub +5s",  priority=True),
-        Binding("left",   "scrub_back",   "Scrub -5s",  priority=True),
-        Binding("up",     "prev_marker",  "Prev marker"),
-        Binding("down",   "next_marker",  "Next marker"),
-        Binding("enter",  "jump_marker",  "Jump",       priority=True),
-        Binding("q",      "quit",         "Quit",       priority=True),
-        Binding("escape", "quit",         "Quit",       show=False),
+        Binding("space", "toggle_play", "Play/Pause", priority=True),
+        Binding("s", "stop", "Stop", priority=True),
+        Binding("right", "scrub_fwd", "Scrub +5s", priority=True),
+        Binding("left", "scrub_back", "Scrub -5s", priority=True),
+        Binding("up", "prev_marker", "Prev marker"),
+        Binding("down", "next_marker", "Next marker"),
+        Binding("enter", "jump_marker", "Jump", priority=True),
+        Binding("w", "toggle_waveform", "Waveform"),
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("escape", "quit", "Quit", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -221,8 +358,9 @@ class TimecodeApp(App[None]):
     }
     """
 
-    def __init__(self, player: "ArtNetTimecodePlayer",
-                 args, markers: list = [], **kwargs) -> None:
+    def __init__(
+        self, player: "ArtNetTimecodePlayer", args, markers: list = [], **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._player = player
         self._args = args
@@ -239,6 +377,7 @@ class TimecodeApp(App[None]):
                     id="timecode",
                     classes="stopped",
                 )
+                yield WaveformWidget(self._player, self._markers, id="waveform")
                 yield Static(self._info_text(), id="info")
                 yield Static("Packets sent:  0", id="packet-count")
                 with Horizontal(id="transport"):
@@ -281,6 +420,7 @@ class TimecodeApp(App[None]):
         if self._markers:
             self.query_one("#marker-panel").add_class("visible")
         self._last_frame: int = -1
+        self._last_wave_col: int = -1
         self.set_interval(1 / 30, self._poll)
 
     def _poll(self) -> None:
@@ -296,14 +436,43 @@ class TimecodeApp(App[None]):
             self.query_one("#markers", MarkerList).auto_track(tc.frame_number)
         self._last_frame = tc.frame_number
 
+        wf = self.query_one("#waveform", WaveformWidget)
+        if wf._envelope is not None:
+            duration_frames = wf._audio_duration_secs * p.fps
+            if duration_frames > 0:
+                frac = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (tc.frame_number - p.start_tc.frame_number) / duration_frames,
+                    ),
+                )
+                W = wf.size.width
+                if W > 0:
+                    col = int(frac * (W - 1))
+                    if col != self._last_wave_col:
+                        wf._playhead_frac = frac
+                        self._last_wave_col = col
+
     def on_unmount(self) -> None:
         self._player.stop()
         self._player.shutdown()
 
-    def action_toggle_play(self) -> None: self._player.toggle_play_pause()
-    def action_stop(self)        -> None: self._player.stop()
-    def action_scrub_fwd(self)   -> None: self._player.scrub(+5.0)
-    def action_scrub_back(self)  -> None: self._player.scrub(-5.0)
+    def action_toggle_waveform(self) -> None:
+        wf = self.query_one("#waveform", WaveformWidget)
+        wf.display = not wf.display
+
+    def action_toggle_play(self) -> None:
+        self._player.toggle_play_pause()
+
+    def action_stop(self) -> None:
+        self._player.stop()
+
+    def action_scrub_fwd(self) -> None:
+        self._player.scrub(+5.0)
+
+    def action_scrub_back(self) -> None:
+        self._player.scrub(-5.0)
 
     def action_prev_marker(self) -> None:
         if self._markers:
