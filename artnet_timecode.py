@@ -465,6 +465,26 @@ def _alt_screen_off()         -> str:   return "\033[?1049l"
 def _clear_screen()           -> str:   return "\033[2J"
 def _eol()                    -> str:   return "\033[K"   # erase to end of line
 
+def _top_border(bc: int, w: int) -> str:
+    title = "  Art-Net Timecode Player  "
+    pad_l = (w - 2 - len(title)) // 2
+    pad_r = w - 2 - pad_l - len(title)
+    return (
+        f"\033[{bc}m╔{'═' * pad_l}"
+        f"\033[1;37m{title}"
+        f"\033[{bc}m{'═' * pad_r}╗\033[0m"
+    )
+
+def _bot_border(bc: int, w: int, status: str) -> str:
+    inner = f" {status} " if status else ""
+    pad_l = (w - 2 - len(inner)) // 2
+    pad_r = w - 2 - pad_l - len(inner)
+    return (
+        f"\033[{bc}m╚{'═' * pad_l}"
+        f"\033[2m{inner}"
+        f"\033[{bc}m{'═' * pad_r}╝\033[0m"
+    )
+
 # Colours (ANSI 256-colour or basic)
 _C = {
     "red":    31, "green": 32, "yellow": 33,
@@ -578,19 +598,6 @@ class DirectTUI:
         # Border colour driven by initial state (will be redrawn on state change)
         bc = _C["red"]
 
-        top_line    = "╔" + "═" * (w - 2) + "╗"
-        bot_line    = "╚" + "═" * (w - 2) + "╝"
-        empty_line  = "║" + " " * (w - 2) + "║"
-
-        title = "  Art-Net Timecode Player  "
-        title_pad = (w - 2 - len(title)) // 2
-        top_with_title = (
-            "╔" + "═" * title_pad
-            + _bold(_fg(37, title))
-            + "═" * (w - 2 - title_pad - len(title))
-            + "╗"
-        )
-
         # Static info rows
         dest_str = c.ip
         if c.broadcast or c.ip.endswith(".255"):
@@ -625,7 +632,7 @@ class DirectTUI:
 
         self._w(_hide_cursor())
         self._w(_goto(self._row(_REL_BORDER_TOP), 1))
-        self._w(_fg(bc, top_with_title), _eol(), "\n")
+        self._w(_top_border(bc, w), _eol(), "\n")
 
         for rel in range(2, UI_HEIGHT - 1):
             self._w(_goto(self._row(rel), 1))
@@ -654,7 +661,7 @@ class DirectTUI:
 
         # Bottom border
         self._w(_goto(self._row(_REL_BORDER_BOT), 1))
-        self._w(_fg(bc, bot_line), _eol())
+        self._w(_bot_border(bc, w, ""), _eol())
 
         self._flush()
         # Now draw the dynamic parts
@@ -679,7 +686,7 @@ class DirectTUI:
 
     # ── Marker panel ──────────────────────────────────────────────────────────
     def _draw_markers(self) -> None:
-        """Redraw all visible marker rows."""
+        """Redraw all visible marker rows. Caller is responsible for flushing."""
         for i in range(self._n_vis):
             rel   = _REL_MARKERS_FIRST + i
             abs_i = self._marker_scroll + i
@@ -707,8 +714,6 @@ class DirectTUI:
                   else " ")
         self._w(_goto(hdr_row, self._cols - 3))
         self._w(up_ind + dn_ind)
-
-        self._flush()
 
     def _clamp_scroll_to_cursor(self) -> None:
         if self._marker_cursor < self._marker_scroll:
@@ -744,26 +749,12 @@ class DirectTUI:
         if state != self._last_state:
             self._w(_goto(self._row(_REL_STATE), 1))
             self._w(self._centre(_bold(_fg(col, label)), len(label)), _eol())
-            # Redraw borders in new colour (top + bottom)
-            bc = col
-            top_line = "╔" + "═" * (w - 2) + "╗"
-            bot_line = "╚" + "═" * (w - 2) + "╝"
-            title = "  Art-Net Timecode Player  "
-            title_pad = (w - 2 - len(title)) // 2
-            top_with_title = (
-                "╔" + "═" * title_pad
-                + _bold(_fg(37, title))
-                + "═" * (w - 2 - title_pad - len(title))
-                + "╗"
-            )
+            # Redraw top border and side borders in new colour
             self._w(_goto(self._row(_REL_BORDER_TOP), 1))
-            self._w(_fg(bc, top_with_title), _eol())
-            self._w(_goto(self._row(_REL_BORDER_BOT), 1))
-            self._w(_fg(bc, bot_line), _eol())
-            # Redraw side borders in new colour
+            self._w(_top_border(col, w), _eol())
             for rel in range(2, UI_HEIGHT - 1):
-                self._w(_goto(self._row(rel), 1),         _fg(bc, "║"))
-                self._w(_goto(self._row(rel), w),         _fg(bc, "║"))
+                self._w(_goto(self._row(rel), 1),  _fg(col, "║"))
+                self._w(_goto(self._row(rel), w),  _fg(col, "║"))
             self._last_state = state
             changed = True
 
@@ -798,18 +789,20 @@ class DirectTUI:
             self._last_pkts = pkts
             changed = True
 
-        # Subtitle (status msg) in bottom border
-        status = f" {p.status_msg} "
-        self._w(_goto(self._row(_REL_SUBTITLE), w // 2 - len(status) // 2))
-        self._w(_dim(status), _eol())
-
-        if changed:
-            self._flush()
+        # Bottom border with embedded status (redrawn every refresh so status stays current)
+        self._w(_goto(self._row(_REL_BORDER_BOT), 1))
+        self._w(_bot_border(col, w, p.status_msg), _eol())
 
         # Marker list (redrawn whenever cursor moves or on first draw)
         if self._markers and self._marker_cursor != self._last_cursor:
             self._draw_markers()
             self._last_cursor = self._marker_cursor
+
+        # Restore right border for all content rows — _eol() calls in TC, packet,
+        # and marker draws may have erased it; do this last so the border is final.
+        for rel in range(2, UI_HEIGHT - 1):
+            self._w(_goto(self._row(rel), w), _fg(col, "║"))
+        self._flush()
 
     # ── Enter / exit ──────────────────────────────────────────────────────────
     def __enter__(self):
