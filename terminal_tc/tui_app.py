@@ -566,11 +566,24 @@ class TrackList(Widget):
             self._scroll = max(0, self.cursor - h + 1)
 
     def on_click(self, event) -> None:
-        row = event.offset.y - 1 + self._scroll  # -1 for header row
+        row = event.offset.y - 2 + self._scroll  # -1 border-top, -1 header
         if 0 <= row < len(self._tracks):
             self.cursor = row
             self._clamp()
-            self.post_message(TrackList.Activated(row))
+            self.refresh()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        self._scroll = max(0, self._scroll - 1)
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        max_scroll = max(0, len(self._tracks) - max(1, self.size.height - 1))
+        self._scroll = min(max_scroll, self._scroll + 1)
+        self.refresh()
 
 
 class TimecodeCommands(Provider):
