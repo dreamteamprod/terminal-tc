@@ -204,6 +204,19 @@ class MarkerList(Widget):
         if 0 <= row < len(self._markers):
             self.set_cursor(row)
 
+    def on_mouse_scroll_up(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        self._scroll = max(0, self._scroll - 1)
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        max_scroll = max(0, len(self._markers) - max(1, self.size.height))
+        self._scroll = min(max_scroll, self._scroll + 1)
+        self.refresh()
+
 
 class WaveformWidget(Widget):
     """Audio waveform with a scrolling playhead and marker lines."""
@@ -760,6 +773,7 @@ class TimecodeApp(App[None]):
         )
         if c.tc_offset_frames != 0:
             from .artnet_timecode import format_tc_offset
+
             info += f"\nTC Offset:    {format_tc_offset(c.fps, c.tc_offset_frames)}  (Art-Net only)"
         return info
 
@@ -1115,12 +1129,16 @@ class TimecodeApp(App[None]):
         self._set_nav_mode("" if self._nav_mode == "markers" else "markers")
 
     def action_prev_marker(self) -> None:
+        if int(self._player.state) == 1:
+            return
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(-1)
         elif self._nav_mode == "markers" and self._markers:
             self.query_one("#markers", MarkerList).move_cursor(-1)
 
     def action_next_marker(self) -> None:
+        if int(self._player.state) == 1:
+            return
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(+1)
         elif self._nav_mode == "markers" and self._markers:
@@ -1572,6 +1590,7 @@ class SettingsScreen(ModalScreen):
                     with Horizontal(classes="field-row"):
                         yield Label("TC Offset (Art-Net)", classes="field-label")
                         from .artnet_timecode import format_tc_offset
+
                         yield Input(
                             value=format_tc_offset(cfg.fps, cfg.tc_offset_frames),
                             id="inp-tc-offset",
@@ -1664,7 +1683,10 @@ class SettingsScreen(ModalScreen):
             osc_port_str = self.query_one("#inp-osc-port", Input).value.strip()
             tc_offset_str = self.query_one("#inp-tc-offset", Input).value.strip()
             from .artnet_timecode import parse_tc_offset
-            tc_offset_frames = parse_tc_offset(fps, tc_offset_str) if tc_offset_str else 0
+
+            tc_offset_frames = (
+                parse_tc_offset(fps, tc_offset_str) if tc_offset_str else 0
+            )
             cfg = dataclasses.replace(
                 self._initial_config,
                 ip=self.query_one("#inp-ip", Input).value.strip(),

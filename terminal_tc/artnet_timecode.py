@@ -154,9 +154,9 @@ def tc_from_frame_number(fps: float, frame_number: int) -> _LibTimecode:
 def parse_tc_offset(fps: float, s: str) -> int:
     """Parse [±]HH:MM:SS:FF to a signed frame count. No sign or '+' = positive."""
     s = s.strip()
-    sign = -1 if s.startswith('-') else 1
-    clean = s.lstrip('+-').strip()
-    parts = clean.replace(';', ':').split(':')
+    sign = -1 if s.startswith("-") else 1
+    clean = s.lstrip("+-").strip()
+    parts = clean.replace(";", ":").split(":")
     if len(parts) != 4:
         raise ValueError(f"Expected [±]HH:MM:SS:FF, got {s!r}")
     h, m, sec, f = (int(p) for p in parts)
@@ -167,7 +167,7 @@ def parse_tc_offset(fps: float, s: str) -> int:
 
 def format_tc_offset(fps: float, frames: int) -> str:
     """Format a signed frame count as [±]HH:MM:SS:FF."""
-    sign = '-' if frames < 0 else '+'
+    sign = "-" if frames < 0 else "+"
     tc = tc_from_frame_number(fps, abs(frames))
     return f"{sign}{tc.hrs:02d}:{tc.mins:02d}:{tc.secs:02d}:{tc.frs:02d}"
 
@@ -436,7 +436,9 @@ class ArtNetTimecodePlayer:
             try:
                 out_fn = max(0, local_fn + self.tc_offset_frames)
                 out_tc = tc_from_frame_number(self.fps, out_fn)
-                pkt = build_artimecode(out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type)
+                pkt = build_artimecode(
+                    out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type
+                )
                 self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
                 self.packet_count += 1
             except Exception:
@@ -514,7 +516,9 @@ class ArtNetTimecodePlayer:
         try:
             out_fn = max(0, abs_frame + self.tc_offset_frames)
             out_tc = tc_from_frame_number(self.fps, out_fn)
-            pkt = build_artimecode(out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type)
+            pkt = build_artimecode(
+                out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type
+            )
             self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
             self.packet_count += 1
         except Exception:
@@ -813,7 +817,9 @@ def main() -> None:
     if "tc_offset" in cli_dict:
         fps_for_parse = float(cli_dict.get("fps", saved_config.fps))
         try:
-            cli_dict["tc_offset_frames"] = parse_tc_offset(fps_for_parse, cli_dict.pop("tc_offset"))
+            cli_dict["tc_offset_frames"] = parse_tc_offset(
+                fps_for_parse, cli_dict.pop("tc_offset")
+            )
         except ValueError as exc:
             print(f"  ✗ --tc-offset: {exc}", file=sys.stderr)
             sys.exit(1)
