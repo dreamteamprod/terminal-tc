@@ -14,6 +14,7 @@ Sends ArtTimeCode UDP packets to control lighting consoles, audio systems, or an
 - Waveform visualisation with Unicode half-block rendering
 - In-TUI settings screen — no flags needed for basic setup
 - Settings persisted at `~/.config/artnet-timecode/config.json`
+- Incoming OSC listener for remote transport and track control
 - Non-interactive / headless mode (piped stdin or CI)
 
 ## Requirements
@@ -83,6 +84,30 @@ Three formats are auto-detected by inspecting the first non-empty line:
 | **Audacity labels** | Everything else | `start\tend\tlabel` |
 
 All formats normalise to `(id, name, timecode)` tuples sorted by frame number.
+
+## OSC Control
+
+The app can receive incoming OSC messages to drive playback and track selection from DAWs, QLab, TouchOSC, or any OSC-capable controller.
+
+**Enable:** open Settings (`Ctrl+,`) → Network tab → flip the **OSC Listener** switch. Set the port (default: `9000`) and save. The listener starts immediately — no restart required. Status is shown in the main info panel.
+
+| Address | Argument | Action |
+|---|---|---|
+| `/play` | — | Start or resume playback |
+| `/pause` | — | Pause playback |
+| `/stop` | — | Stop and rewind to start TC |
+| `/toggle` | — | Toggle play/pause |
+| `/track` | `int` | Switch to track by 0-based index |
+| `/track` | `string` | Switch to track by name (case-insensitive) |
+
+Out-of-range indices and unmatched names are silently ignored.
+
+**Quick test** (requires `python-osc`, installed as a dependency):
+
+```bash
+python -c "from pythonosc.udp_client import SimpleUDPClient; SimpleUDPClient('127.0.0.1', 9000).send_message('/play', [])"
+python -c "from pythonosc.udp_client import SimpleUDPClient; SimpleUDPClient('127.0.0.1', 9000).send_message('/track', 1)"
+```
 
 ## Configuration
 
