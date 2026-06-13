@@ -748,12 +748,15 @@ class TimecodeApp(App[None]):
         fps_label = _FPS_LABEL.get(c.fps, f"{c.fps} fps")
         audio = self._audio_status()
         name = track.name if track else "—"
+        osc = getattr(self, "_osc_server", None)
+        osc_status = f"listening on port {c.osc_port}" if osc else "off"
         return (
             f"Track:        {name}\n"
             f"Destination:  {dest}\n"
             f"Frame rate:   {fps_label}\n"
             f"Start TC:     {p.start_tc}\n"
-            f"Audio:        {audio}"
+            f"Audio:        {audio}\n"
+            f"OSC:          {osc_status}"
         )
 
     def _audio_status(self) -> str:
@@ -773,7 +776,48 @@ class TimecodeApp(App[None]):
             self.query_one("#marker-panel").add_class("visible")
         self._last_frame: int = -1
         self._last_wave_col: int = -1
+        self._osc_server = None
         self.set_interval(1 / 30, self._poll)
+        if self._config.osc_enabled:
+            self._start_osc_server()
+            self.query_one("#info", Static).update(self._info_text())
+
+    def _restart_osc_server(self) -> None:
+        osc = getattr(self, "_osc_server", None)
+        if osc:
+            osc.shutdown()
+            self._osc_server = None
+        if self._config.osc_enabled:
+            self._start_osc_server()
+
+    def _start_osc_server(self) -> None:
+        from .osc_server import OSCServer
+
+        def _on_track(val: int | str) -> None:
+            idx = self._resolve_track(val)
+            if idx is not None:
+                self.call_from_thread(self._switch_track, idx)
+
+        # Use lambdas so callbacks always reference the current player even after
+        # a player rebuild triggered by settings changes.
+        self._osc_server = OSCServer(
+            port=self._config.osc_port,
+            on_play=lambda: self._player.play(),
+            on_pause=lambda: self._player.pause(),
+            on_stop=lambda: self._player.stop(),
+            on_toggle=lambda: self._player.toggle_play_pause(),
+            on_track=_on_track,
+        )
+        self._osc_server.start()
+
+    def _resolve_track(self, val: int | str) -> int | None:
+        if isinstance(val, int):
+            return val if 0 <= val < len(self._tracks) else None
+        name = str(val).lower()
+        for i, t in enumerate(self._tracks):
+            if t.name.lower() == name:
+                return i
+        return None
 
     def _poll(self) -> None:
         try:
@@ -823,6 +867,9 @@ class TimecodeApp(App[None]):
     def on_unmount(self) -> None:
         self._player.stop()
         self._player.shutdown()
+        osc = getattr(self, "_osc_server", None)
+        if osc:
+            osc.shutdown()
 
     # ── Track management ──────────────────────────────────────────────────────
 
@@ -936,6 +983,7 @@ class TimecodeApp(App[None]):
         self._player.stop()
         self._player.shutdown()
         self._config = new_config
+        self._restart_osc_server()
         self._tracks = new_tracks
         self._active_idx = min(self._active_idx, max(0, len(self._tracks) - 1))
         save_config(self._update_config_tracks())
@@ -1489,6 +1537,17 @@ class SettingsScreen(ModalScreen):
                     with Horizontal(classes="field-row"):
                         yield Label("Force Broadcast", classes="field-label")
                         yield Switch(value=cfg.broadcast, id="sw-broadcast")
+                    with Horizontal(classes="field-row"):
+                        yield Label("OSC Listener", classes="field-label")
+                        yield Switch(value=cfg.osc_enabled, id="sw-osc-enabled")
+                    with Horizontal(classes="field-row"):
+                        yield Label("OSC Port", classes="field-label")
+                        yield Input(
+                            value=str(cfg.osc_port),
+                            id="inp-osc-port",
+                            type="integer",
+                            placeholder="9000",
+                        )
                 with TabPane("Timecode", id="tab-timecode"):
                     with Horizontal(classes="field-row"):
                         yield Label("Frame Rate", classes="field-label")
@@ -1500,7 +1559,9 @@ class SettingsScreen(ModalScreen):
                         )
                     with Horizontal(classes="field-row"):
                         yield Label("Reset TC on Stop", classes="field-label")
-                        yield Switch(value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop")
+                        yield Switch(
+                            value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop"
+                        )
                 with TabPane("Tracks", id="tab-tracks"):
                     yield TrackList(
                         self._working_tracks,
@@ -1584,6 +1645,7 @@ class SettingsScreen(ModalScreen):
         try:
             fps_raw = self.query_one("#sel-fps", Select).value
             port_str = self.query_one("#inp-port", Input).value.strip()
+            osc_port_str = self.query_one("#inp-osc-port", Input).value.strip()
             cfg = dataclasses.replace(
                 self._initial_config,
                 ip=self.query_one("#inp-ip", Input).value.strip(),
@@ -1591,6 +1653,8 @@ class SettingsScreen(ModalScreen):
                 broadcast=self.query_one("#sw-broadcast", Switch).value,
                 fps=float(fps_raw) if fps_raw is not Select.BLANK else 25.0,
                 reset_tc_on_stop=self.query_one("#sw-reset-tc-on-stop", Switch).value,
+                osc_enabled=self.query_one("#sw-osc-enabled", Switch).value,
+                osc_port=int(osc_port_str) if osc_port_str else 9000,
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")

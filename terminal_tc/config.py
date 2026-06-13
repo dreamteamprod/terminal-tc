@@ -82,6 +82,8 @@ class AppConfig:
     marker_format: str = "auto"
     tracks: list = dataclasses.field(default_factory=list)  # list[TrackConfig]
     reset_tc_on_stop: bool = True
+    osc_enabled: bool = False
+    osc_port: int = 9000
 
 
 def _config_from_dict(data: dict) -> AppConfig:

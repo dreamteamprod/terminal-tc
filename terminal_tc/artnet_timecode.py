@@ -864,6 +864,24 @@ def main() -> None:
 
     # ── Non-interactive fallback (piped stdin / CI) ────────────────────────────
     if not _is_interactive():
+        osc_srv = None
+        if config.osc_enabled:
+            from .osc_server import OSCServer
+
+            def _noop_track(val):
+                print(f"\n[OSC] /track ignored in non-interactive mode (got {val!r})")
+
+            osc_srv = OSCServer(
+                port=config.osc_port,
+                on_play=player.play,
+                on_pause=player.pause,
+                on_stop=player.stop,
+                on_toggle=player.toggle_play_pause,
+                on_track=_noop_track,
+            )
+            osc_srv.start()
+            print(f"OSC listener active on port {config.osc_port}")
+
         print("Non-interactive mode — auto-playing. Send SIGINT to stop.")
         player.play()
         try:
@@ -875,6 +893,8 @@ def main() -> None:
         finally:
             player.stop()
             player.shutdown()
+            if osc_srv:
+                osc_srv.shutdown()
         return
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
