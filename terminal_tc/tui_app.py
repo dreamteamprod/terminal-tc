@@ -15,7 +15,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
@@ -1179,7 +1179,7 @@ class TrackEditModal(ModalScreen):
     TrackEditModal {
         align: center middle;
     }
-    TrackEditModal > Vertical {
+    TrackEditModal > VerticalScroll {
         width: 74;
         height: auto;
         max-height: 90%;
@@ -1237,7 +1237,7 @@ class TrackEditModal(ModalScreen):
             ("Audacity Labels", "audacity"),
             ("CuePoints TSV", "cuepoints"),
         ]
-        with Vertical():
+        with VerticalScroll():
             yield Label(f"♪  {title}", id="modal-title")
             with Horizontal(classes="field-row"):
                 yield Label("Track Name", classes="field-label")
@@ -1445,13 +1445,16 @@ class SettingsScreen(ModalScreen):
     SettingsScreen {
         align: center middle;
     }
-    SettingsScreen > Vertical {
+    SettingsScreen > VerticalScroll {
         width: 74;
         height: auto;
         max-height: 90%;
         background: $surface;
         border: thick $primary;
         padding: 1 2;
+    }
+    SettingsScreen TabbedContent {
+        height: auto;
     }
     SettingsScreen #settings-title {
         text-style: bold;
@@ -1515,7 +1518,7 @@ class SettingsScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         cfg = self._initial_config
         fps_options = [(label, float(fps)) for fps, label in _FPS_LABEL.items()]
-        with Vertical():
+        with VerticalScroll():
             yield Label("⚙  Settings", id="settings-title")
             with TabbedContent():
                 with TabPane("Network", id="tab-network"):
@@ -2119,7 +2122,8 @@ class FileBrowserModal(ModalScreen):
     }
     FileBrowserModal > Vertical {
         width: 80;
-        height: 36;
+        height: auto;
+        max-height: 90%;
         background: $surface;
         border: thick $primary;
         padding: 1 2;
