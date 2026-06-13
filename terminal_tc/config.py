@@ -84,6 +84,7 @@ class AppConfig:
     reset_tc_on_stop: bool = True
     osc_enabled: bool = False
     osc_port: int = 9000
+    tc_offset_frames: int = 0
 
 
 def _config_from_dict(data: dict) -> AppConfig:

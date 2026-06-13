@@ -750,7 +750,7 @@ class TimecodeApp(App[None]):
         name = track.name if track else "—"
         osc = getattr(self, "_osc_server", None)
         osc_status = f"listening on port {c.osc_port}" if osc else "off"
-        return (
+        info = (
             f"Track:        {name}\n"
             f"Destination:  {dest}\n"
             f"Frame rate:   {fps_label}\n"
@@ -758,6 +758,10 @@ class TimecodeApp(App[None]):
             f"Audio:        {audio}\n"
             f"OSC:          {osc_status}"
         )
+        if c.tc_offset_frames != 0:
+            from .artnet_timecode import format_tc_offset
+            info += f"\nTC Offset:    {format_tc_offset(c.fps, c.tc_offset_frames)}  (Art-Net only)"
+        return info
 
     def _audio_status(self) -> str:
         p = self._player
@@ -1565,6 +1569,14 @@ class SettingsScreen(ModalScreen):
                         yield Switch(
                             value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop"
                         )
+                    with Horizontal(classes="field-row"):
+                        yield Label("TC Offset (Art-Net)", classes="field-label")
+                        from .artnet_timecode import format_tc_offset
+                        yield Input(
+                            value=format_tc_offset(cfg.fps, cfg.tc_offset_frames),
+                            id="inp-tc-offset",
+                            placeholder="+00:00:00:00",
+                        )
                 with TabPane("Tracks", id="tab-tracks"):
                     yield TrackList(
                         self._working_tracks,
@@ -1647,17 +1659,22 @@ class SettingsScreen(ModalScreen):
     def _try_save(self) -> None:
         try:
             fps_raw = self.query_one("#sel-fps", Select).value
+            fps = float(fps_raw) if fps_raw is not Select.BLANK else 25.0
             port_str = self.query_one("#inp-port", Input).value.strip()
             osc_port_str = self.query_one("#inp-osc-port", Input).value.strip()
+            tc_offset_str = self.query_one("#inp-tc-offset", Input).value.strip()
+            from .artnet_timecode import parse_tc_offset
+            tc_offset_frames = parse_tc_offset(fps, tc_offset_str) if tc_offset_str else 0
             cfg = dataclasses.replace(
                 self._initial_config,
                 ip=self.query_one("#inp-ip", Input).value.strip(),
                 port=int(port_str) if port_str else 6454,
                 broadcast=self.query_one("#sw-broadcast", Switch).value,
-                fps=float(fps_raw) if fps_raw is not Select.BLANK else 25.0,
+                fps=fps,
                 reset_tc_on_stop=self.query_one("#sw-reset-tc-on-stop", Switch).value,
                 osc_enabled=self.query_one("#sw-osc-enabled", Switch).value,
                 osc_port=int(osc_port_str) if osc_port_str else 9000,
+                tc_offset_frames=tc_offset_frames,
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
