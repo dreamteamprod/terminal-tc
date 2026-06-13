@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from enum import IntEnum
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import AppConfig, SUPPORTED_FPS, load_config, validate_config
 
@@ -252,15 +252,18 @@ class VideoController:
         self._mpv_cmd = mpv_cmd
         self._proc: Optional[subprocess.Popen] = None
         self._sock_path = f"/tmp/artnet-tc-video-{os.getpid()}.sock"
+        self._on_ready: Optional[Callable] = None
 
-    def launch(self, video_path: str, start_seconds: float) -> None:
-        """Start mpv at start_seconds, non-blocking. Unpauses once IPC socket is ready."""
+    def launch(self, video_path: str, start_seconds: float, on_ready: Optional[Callable] = None) -> None:
+        """Start mpv at start_seconds, non-blocking. Calls on_ready once IPC socket is ready and video unpauses."""
         self._kill()
+        self._on_ready = on_ready
         cmd = [
             self._mpv_cmd,
             f"--input-ipc-server={self._sock_path}",
             f"--start={start_seconds:.3f}",
             "--pause",
+            "--mute=yes",
             "--no-terminal",
             "--keep-open=yes",
             "--force-window=yes",
@@ -277,8 +280,13 @@ class VideoController:
             if os.path.exists(self._sock_path):
                 time.sleep(0.02)
                 self._ipc(["set_property", "pause", False])
+                if self._on_ready:
+                    self._on_ready()
                 return
             time.sleep(0.05)
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def _ipc(self, command: list) -> None:
         if not os.path.exists(self._sock_path):
@@ -526,25 +534,43 @@ class ArtNetTimecodePlayer:
                 self._tc = self.start_tc
             self._pause_frame_acc = 0
 
-        self._stop_event.clear()
-        self._play_start_wall = time.perf_counter()
         self.state = State.PLAYING
         self.status_msg = "Playing"
+        self._play_start_wall = time.perf_counter()  # set now so pause() is always safe
 
-        # Start audio at matching offset
+        if self._video_ctrl and self._video_path:
+            video_pos = self._video_offset + self._pause_frame_acc / self.fps
+            if self._video_ctrl.is_running():
+                # Window already open: seek to position, resume, and start everything now.
+                self._video_ctrl.seek(video_pos)
+                self._video_ctrl.resume()
+                self._start_playback()
+            else:
+                # Fresh launch: defer ticker/audio start until video signals ready.
+                self._video_ctrl.launch(self._video_path, video_pos, on_ready=self._on_video_ready)
+        else:
+            self._start_playback()
+
+    def _start_playback(self) -> None:
+        """Start ticker and audio immediately (used when no launch delay is needed)."""
+        self._stop_event.clear()
+        self._play_start_wall = time.perf_counter()
         if self._audio_loaded:
             audio_offset = round(
                 (self._pause_frame_acc / self.fps) * self._audio_samplerate
             )
             self._start_audio_at(audio_offset)
-
-        # Start video at matching offset
-        if self._video_ctrl and self._video_path:
-            video_pos = self._video_offset + self._pause_frame_acc / self.fps
-            self._video_ctrl.launch(self._video_path, video_pos)
-
         self._ticker_thread = threading.Thread(target=self._ticker, daemon=True)
         self._ticker_thread.start()
+
+    def _on_video_ready(self) -> None:
+        """Called by VideoController once mpv is unpaused and displaying frames."""
+        if self.state != State.PLAYING:
+            # State changed while waiting (user paused/stopped): re-pause the video.
+            if self._video_ctrl:
+                self._video_ctrl.pause()
+            return
+        self._start_playback()
 
     def pause(self) -> None:
         if self.state != State.PLAYING:
