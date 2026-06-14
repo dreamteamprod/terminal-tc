@@ -326,6 +326,7 @@ class ArtNetTimecodePlayer:
         self._audio_loaded: bool = False
         self._audio_error: str = ""
         self._audio_channels: int = 2
+        self._audio_ended_naturally: bool = False
 
         if audio_path:
             self._load_audio(audio_path)
@@ -385,6 +386,8 @@ class ArtNetTimecodePlayer:
                     stream.write(chunk)  # blocks in C, GIL released during wait
                     pos += chunk_size
                 self._audio_pos = pos
+                if not self._stop_event.is_set():
+                    self._audio_ended_naturally = True
         except Exception as e:
             self._audio_error = f"Audio error: {e}"
 
@@ -457,6 +460,7 @@ class ArtNetTimecodePlayer:
             self._pause_frame_acc = 0
 
         self._stop_event.clear()
+        self._audio_ended_naturally = False
         self._play_start_wall = time.perf_counter()
         self.state = State.PLAYING
         self.status_msg = "Playing"
@@ -481,7 +485,7 @@ class ArtNetTimecodePlayer:
         self.status_msg = "Paused"
         self._stop_audio()
 
-    def stop(self) -> None:
+    def stop(self, *, reset_tc: bool | None = None) -> None:
         if self.state == State.STOPPED:
             return
         self._stop_event.set()
@@ -489,7 +493,7 @@ class ArtNetTimecodePlayer:
         self._pause_frame_acc = 0
         self.status_msg = "Stopped"
         self._stop_audio()
-        if self.reset_tc_on_stop:
+        if reset_tc if reset_tc is not None else self.reset_tc_on_stop:
             with self._tc_lock:
                 self._tc = self.start_tc
             try:

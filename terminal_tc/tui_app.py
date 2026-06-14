@@ -854,6 +854,17 @@ class TimecodeApp(App[None]):
         try:
             p = self._player
             state_int = int(p.state)
+            if state_int == 1 and p._audio_ended_naturally:
+                track = self._active_track()
+                if track is not None:
+                    effective = (
+                        track.stop_on_audio_end
+                        if track.stop_on_audio_end is not None
+                        else self._config.stop_on_audio_end
+                    )
+                    if effective:
+                        p.stop(reset_tc=False)
+                        state_int = int(p.state)
             tc = p.get_tc()
             self.query_one("#state", StateDisplay).update_state(state_int)
             self.query_one("#timecode", TimecodeDisplay).update_tc(str(tc), state_int)
@@ -1328,6 +1339,25 @@ class TrackEditModal(ModalScreen):
                     id="sel-markers-absolute",
                     allow_blank=False,
                 )
+            with Horizontal(classes="field-row"):
+                yield Label("Stop on Audio End", classes="field-label")
+                _sae_value = (
+                    "true"
+                    if t.stop_on_audio_end is True
+                    else "false"
+                    if t.stop_on_audio_end is False
+                    else "inherit"
+                )
+                yield Select(
+                    [
+                        ("Use global default", "inherit"),
+                        ("Yes — stop", "true"),
+                        ("No — continue", "false"),
+                    ],
+                    value=_sae_value,
+                    id="sel-stop-on-audio-end",
+                    allow_blank=False,
+                )
             yield Static("", id="validation-error")
             with Horizontal(id="modal-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
@@ -1363,6 +1393,8 @@ class TrackEditModal(ModalScreen):
         try:
             fmt_raw = self.query_one("#sel-marker-format", Select).value
             abs_raw = self.query_one("#sel-markers-absolute", Select).value
+            sae_raw = self.query_one("#sel-stop-on-audio-end", Select).value
+            sae_map = {"true": True, "false": False, "inherit": None}
             track = TrackConfig(
                 name=self.query_one("#inp-name", Input).value.strip(),
                 start_hours=int(self.query_one("#inp-hours", Input).value or "0"),
@@ -1373,6 +1405,7 @@ class TrackEditModal(ModalScreen):
                 markers=self.query_one("#inp-markers", Input).value.strip() or None,
                 marker_format=str(fmt_raw) if fmt_raw is not Select.BLANK else "auto",
                 markers_absolute=abs_raw != "relative",
+                stop_on_audio_end=sae_map.get(str(sae_raw), None),
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
@@ -1601,6 +1634,11 @@ class SettingsScreen(ModalScreen):
                             value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop"
                         )
                     with Horizontal(classes="field-row"):
+                        yield Label("Stop on Audio End", classes="field-label")
+                        yield Switch(
+                            value=cfg.stop_on_audio_end, id="sw-stop-on-audio-end"
+                        )
+                    with Horizontal(classes="field-row"):
                         yield Label("TC Offset (Art-Net)", classes="field-label")
                         from .artnet_timecode import format_tc_offset
 
@@ -1707,6 +1745,7 @@ class SettingsScreen(ModalScreen):
                 broadcast=self.query_one("#sw-broadcast", Switch).value,
                 fps=fps,
                 reset_tc_on_stop=self.query_one("#sw-reset-tc-on-stop", Switch).value,
+                stop_on_audio_end=self.query_one("#sw-stop-on-audio-end", Switch).value,
                 osc_enabled=self.query_one("#sw-osc-enabled", Switch).value,
                 osc_port=int(osc_port_str) if osc_port_str else 9000,
                 tc_offset_frames=tc_offset_frames,
