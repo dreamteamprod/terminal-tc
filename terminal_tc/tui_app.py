@@ -242,6 +242,7 @@ class WaveformWidget(Widget):
         self._total_samples: int = 0
         self._view_env_cache: "tuple | None" = None
         self._manually_panned: bool = False
+        self._cursor_marker_idx: int = -1
 
     def _compute_envelope(self) -> None:
         self._envelope = None
@@ -333,7 +334,8 @@ class WaveformWidget(Widget):
 
         # Active marker: last one whose TC is at or before the current playhead
         active_marker_idx = -1
-        visible_markers: "list[tuple[int, str, bool]]" = []  # (col, label, is_active)
+        # (col, label, is_active, is_cursor)
+        visible_markers: "list[tuple[int, str, bool, bool]]" = []
         if self._audio_duration_secs > 0:
             p = self._player
             start_fn = p.start_tc.frame_number
@@ -349,18 +351,30 @@ class WaveformWidget(Widget):
                 col = self._frac_to_col(frac, W)
                 if col is not None:
                     label = f"{mid}:{name}" if mid else name
-                    visible_markers.append((col, label, i == active_marker_idx))
+                    visible_markers.append(
+                        (col, label, i == active_marker_idx, i == self._cursor_marker_idx)
+                    )
         visible_markers.sort(key=lambda x: x[0])
-        marker_col_set = {col for col, _, _ in visible_markers}
+        active_col_set = {col for col, _, is_active, _ in visible_markers if is_active}
+        cursor_col_set = {col for col, _, _, is_cursor in visible_markers if is_cursor}
+        other_col_set = {
+            col for col, _, is_active, is_cursor in visible_markers
+            if not is_active and not is_cursor
+        }
 
         # Build the two label rows
         label_chars: "list[tuple[str, str | None]]" = [(" ", None)] * W
         connect_chars: "list[tuple[str, str | None]]" = [(" ", None)] * W
 
-        for i, (col, label, is_active) in enumerate(visible_markers):
+        for i, (col, label, is_active, is_cursor) in enumerate(visible_markers):
             next_col = visible_markers[i + 1][0] if i + 1 < len(visible_markers) else W
             max_len = max(0, min(next_col - col - 1, W - col))
-            style = "bold bright_white" if is_active else "bold bright_yellow"
+            if is_active:
+                style = "bold bright_white"
+            elif is_cursor:
+                style = "bold bright_cyan"
+            else:
+                style = "bold bright_yellow"
             for j, ch in enumerate(label[:max_len]):
                 if col + j < W:
                     label_chars[col + j] = (ch, style)
@@ -406,7 +420,11 @@ class WaveformWidget(Widget):
 
                 if x == ph_col:
                     out.append("│", style="bold bright_white")
-                elif x in marker_col_set:
+                elif x in cursor_col_set:
+                    out.append("│", style="bold bright_cyan")
+                elif x in active_col_set:
+                    out.append("│", style="bold bright_white")
+                elif x in other_col_set:
                     out.append("│", style="bold bright_yellow")
                 elif u or lo:
                     out.append(char, style="green dim")
@@ -453,6 +471,20 @@ class WaveformWidget(Widget):
         self._view_start = 0.0
         self._view_end = 1.0
         self._manually_panned = False
+        self._view_env_cache = None
+        self.refresh()
+
+    def scroll_to_frac(self, frac: float) -> None:
+        """Pan the view so frac is visible; no-op when fully zoomed out."""
+        span = self._view_end - self._view_start
+        if span >= 1.0:
+            return
+        if self._view_start <= frac <= self._view_end:
+            return
+        new_start = max(0.0, min(1.0 - span, frac - span / 2))
+        self._view_start = new_start
+        self._view_end = new_start + span
+        self._manually_panned = True
         self._view_env_cache = None
         self.refresh()
 
@@ -1123,6 +1155,13 @@ class TimecodeApp(App[None]):
             mode == "tracks", "nav-active"
         )
         self.query_one("#marker-panel").set_class(mode == "markers", "nav-active")
+        if mode != "markers":
+            try:
+                wf = self.query_one("#waveform", WaveformWidget)
+                wf._cursor_marker_idx = -1
+                wf.refresh()
+            except NoMatches:
+                pass
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
@@ -1152,13 +1191,33 @@ class TimecodeApp(App[None]):
     def action_focus_markers(self) -> None:
         self._set_nav_mode("" if self._nav_mode == "markers" else "markers")
 
+    def _scroll_waveform_to_marker(self, marker_idx: int) -> None:
+        if not self._markers or not (0 <= marker_idx < len(self._markers)):
+            return
+        try:
+            wf = self.query_one("#waveform", WaveformWidget)
+            if wf._envelope is None or wf._audio_duration_secs <= 0:
+                return
+            _, _, tc = self._markers[marker_idx]
+            total_frames = wf._audio_duration_secs * self._player.fps
+            if total_frames <= 0:
+                return
+            frac = (tc.frame_number - self._player.start_tc.frame_number) / total_frames
+            wf._cursor_marker_idx = marker_idx
+            wf.scroll_to_frac(max(0.0, min(1.0, frac)))
+            wf.refresh()
+        except NoMatches:
+            pass
+
     def action_prev_marker(self) -> None:
         if int(self._player.state) == 1:
             return
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(-1)
         elif self._nav_mode == "markers" and self._markers:
-            self.query_one("#markers", MarkerList).move_cursor(-1)
+            ml = self.query_one("#markers", MarkerList)
+            ml.move_cursor(-1)
+            self._scroll_waveform_to_marker(ml.cursor)
 
     def action_next_marker(self) -> None:
         if int(self._player.state) == 1:
@@ -1166,7 +1225,9 @@ class TimecodeApp(App[None]):
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(+1)
         elif self._nav_mode == "markers" and self._markers:
-            self.query_one("#markers", MarkerList).move_cursor(+1)
+            ml = self.query_one("#markers", MarkerList)
+            ml.move_cursor(+1)
+            self._scroll_waveform_to_marker(ml.cursor)
 
     def action_jump_marker(self) -> None:
         if self._nav_mode == "tracks":
