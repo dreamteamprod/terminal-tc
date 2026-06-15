@@ -65,6 +65,7 @@ class TrackConfig:
     markers_absolute: bool = True
     video: Optional[str] = None
     video_offset: float = 0.0
+    stop_on_audio_end: Optional[bool] = None  # None = inherit global default
 
 
 @dataclasses.dataclass
@@ -84,6 +85,10 @@ class AppConfig:
     marker_format: str = "auto"
     tracks: list = dataclasses.field(default_factory=list)  # list[TrackConfig]
     reset_tc_on_stop: bool = True
+    stop_on_audio_end: bool = False
+    osc_enabled: bool = False
+    osc_port: int = 9000
+    tc_offset_frames: int = 0
 
 
 def _config_from_dict(data: dict) -> AppConfig:

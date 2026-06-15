@@ -15,7 +15,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
@@ -203,6 +203,19 @@ class MarkerList(Widget):
         row = event.offset.y + self._scroll
         if 0 <= row < len(self._markers):
             self.set_cursor(row)
+
+    def on_mouse_scroll_up(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        self._scroll = max(0, self._scroll - 1)
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        max_scroll = max(0, len(self._markers) - max(1, self.size.height))
+        self._scroll = min(max_scroll, self._scroll + 1)
+        self.refresh()
 
 
 class WaveformWidget(Widget):
@@ -554,11 +567,24 @@ class TrackList(Widget):
             self._scroll = max(0, self.cursor - h + 1)
 
     def on_click(self, event) -> None:
-        row = event.offset.y - 1 + self._scroll  # -1 for header row
+        row = event.offset.y - 2 + self._scroll  # -1 border-top, -1 header
         if 0 <= row < len(self._tracks):
             self.cursor = row
             self._clamp()
-            self.post_message(TrackList.Activated(row))
+            self.refresh()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        self._scroll = max(0, self._scroll - 1)
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        if int(self.app._player.state) == 1:
+            return
+        max_scroll = max(0, len(self._tracks) - max(1, self.size.height - 1))
+        self._scroll = min(max_scroll, self._scroll + 1)
+        self.refresh()
 
 
 class TimecodeCommands(Provider):
@@ -750,14 +776,22 @@ class TimecodeApp(App[None]):
         audio = self._audio_status()
         video = self._video_status()
         name = track.name if track else "—"
-        return (
+        osc = getattr(self, "_osc_server", None)
+        osc_status = f"listening on port {c.osc_port}" if osc else "off"
+        info = (
             f"Track:        {name}\n"
             f"Destination:  {dest}\n"
             f"Frame rate:   {fps_label}\n"
             f"Start TC:     {p.start_tc}\n"
             f"Audio:        {audio}\n"
-            f"Video:        {video}"
+            f"Video:        {video}\n"
+            f"OSC:          {osc_status}"
         )
+        if c.tc_offset_frames != 0:
+            from .artnet_timecode import format_tc_offset
+
+            info += f"\nTC Offset:    {format_tc_offset(c.fps, c.tc_offset_frames)}  (Art-Net only)"
+        return info
 
     def _audio_status(self) -> str:
         p = self._player
@@ -788,13 +822,65 @@ class TimecodeApp(App[None]):
             self.query_one("#marker-panel").add_class("visible")
         self._last_frame: int = -1
         self._last_wave_col: int = -1
+        self._osc_server = None
         self.set_interval(1 / 30, self._poll)
         self.call_after_refresh(self._notify_video_error)
+        if self._config.osc_enabled:
+            self._start_osc_server()
+            self.query_one("#info", Static).update(self._info_text())
+
+    def _restart_osc_server(self) -> None:
+        osc = getattr(self, "_osc_server", None)
+        if osc:
+            osc.shutdown()
+            self._osc_server = None
+        if self._config.osc_enabled:
+            self._start_osc_server()
+
+    def _start_osc_server(self) -> None:
+        from .osc_server import OSCServer
+
+        def _on_track(val: int | str) -> None:
+            idx = self._resolve_track(val)
+            if idx is not None:
+                self.call_from_thread(self._switch_track, idx)
+
+        # Use lambdas so callbacks always reference the current player even after
+        # a player rebuild triggered by settings changes.
+        self._osc_server = OSCServer(
+            port=self._config.osc_port,
+            on_play=lambda: self._player.play(),
+            on_pause=lambda: self._player.pause(),
+            on_stop=lambda: self._player.stop(),
+            on_toggle=lambda: self._player.toggle_play_pause(),
+            on_track=_on_track,
+        )
+        self._osc_server.start()
+
+    def _resolve_track(self, val: int | str) -> int | None:
+        if isinstance(val, int):
+            return val if 0 <= val < len(self._tracks) else None
+        name = str(val).lower()
+        for i, t in enumerate(self._tracks):
+            if t.name.lower() == name:
+                return i
+        return None
 
     def _poll(self) -> None:
         try:
             p = self._player
             state_int = int(p.state)
+            if state_int == 1 and p._audio_ended_naturally:
+                track = self._active_track()
+                if track is not None:
+                    effective = (
+                        track.stop_on_audio_end
+                        if track.stop_on_audio_end is not None
+                        else self._config.stop_on_audio_end
+                    )
+                    if effective:
+                        p.stop(reset_tc=False)
+                        state_int = int(p.state)
             tc = p.get_tc()
             self.query_one("#state", StateDisplay).update_state(state_int)
             self.query_one("#timecode", TimecodeDisplay).update_tc(str(tc), state_int)
@@ -839,6 +925,9 @@ class TimecodeApp(App[None]):
     def on_unmount(self) -> None:
         self._player.stop()
         self._player.shutdown()
+        osc = getattr(self, "_osc_server", None)
+        if osc:
+            osc.shutdown()
 
     # ── Track management ──────────────────────────────────────────────────────
 
@@ -957,6 +1046,7 @@ class TimecodeApp(App[None]):
         self._player.stop()
         self._player.shutdown()
         self._config = new_config
+        self._restart_osc_server()
         self._tracks = new_tracks
         self._active_idx = min(self._active_idx, max(0, len(self._tracks) - 1))
         save_config(self._update_config_tracks())
@@ -1086,12 +1176,16 @@ class TimecodeApp(App[None]):
         self._set_nav_mode("" if self._nav_mode == "markers" else "markers")
 
     def action_prev_marker(self) -> None:
+        if int(self._player.state) == 1:
+            return
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(-1)
         elif self._nav_mode == "markers" and self._markers:
             self.query_one("#markers", MarkerList).move_cursor(-1)
 
     def action_next_marker(self) -> None:
+        if int(self._player.state) == 1:
+            return
         if self._nav_mode == "tracks":
             self.query_one("#track-list", TrackList).move_cursor(+1)
         elif self._nav_mode == "markers" and self._markers:
@@ -1154,7 +1248,7 @@ class TrackEditModal(ModalScreen):
     TrackEditModal {
         align: center middle;
     }
-    TrackEditModal > Vertical {
+    TrackEditModal > VerticalScroll {
         width: 74;
         height: auto;
         max-height: 90%;
@@ -1212,7 +1306,7 @@ class TrackEditModal(ModalScreen):
             ("Audacity Labels", "audacity"),
             ("CuePoints TSV", "cuepoints"),
         ]
-        with Vertical():
+        with VerticalScroll():
             yield Label(f"♪  {title}", id="modal-title")
             with Horizontal(classes="field-row"):
                 yield Label("Track Name", classes="field-label")
@@ -1284,6 +1378,25 @@ class TrackEditModal(ModalScreen):
                     type="number",
                     placeholder="0.0",
                 )
+            with Horizontal(classes="field-row"):
+                yield Label("Stop on Audio End", classes="field-label")
+                _sae_value = (
+                    "true"
+                    if t.stop_on_audio_end is True
+                    else "false"
+                    if t.stop_on_audio_end is False
+                    else "inherit"
+                )
+                yield Select(
+                    [
+                        ("Use global default", "inherit"),
+                        ("Yes — stop", "true"),
+                        ("No — continue", "false"),
+                    ],
+                    value=_sae_value,
+                    id="sel-stop-on-audio-end",
+                    allow_blank=False,
+                )
             yield Static("", id="validation-error")
             with Horizontal(id="modal-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
@@ -1327,6 +1440,8 @@ class TrackEditModal(ModalScreen):
             fmt_raw = self.query_one("#sel-marker-format", Select).value
             abs_raw = self.query_one("#sel-markers-absolute", Select).value
             video_offset_raw = self.query_one("#inp-video-offset", Input).value or "0"
+            sae_raw = self.query_one("#sel-stop-on-audio-end", Select).value
+            sae_map = {"true": True, "false": False, "inherit": None}
             track = TrackConfig(
                 name=self.query_one("#inp-name", Input).value.strip(),
                 start_hours=int(self.query_one("#inp-hours", Input).value or "0"),
@@ -1339,6 +1454,7 @@ class TrackEditModal(ModalScreen):
                 markers_absolute=abs_raw != "relative",
                 video=self.query_one("#inp-video", Input).value.strip() or None,
                 video_offset=float(video_offset_raw),
+                stop_on_audio_end=sae_map.get(str(sae_raw), None),
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
@@ -1446,13 +1562,16 @@ class SettingsScreen(ModalScreen):
     SettingsScreen {
         align: center middle;
     }
-    SettingsScreen > Vertical {
+    SettingsScreen > VerticalScroll {
         width: 74;
         height: auto;
         max-height: 90%;
         background: $surface;
         border: thick $primary;
         padding: 1 2;
+    }
+    SettingsScreen TabbedContent {
+        height: auto;
     }
     SettingsScreen #settings-title {
         text-style: bold;
@@ -1516,7 +1635,7 @@ class SettingsScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         cfg = self._initial_config
         fps_options = [(label, float(fps)) for fps, label in _FPS_LABEL.items()]
-        with Vertical():
+        with VerticalScroll():
             yield Label("⚙  Settings", id="settings-title")
             with TabbedContent():
                 with TabPane("Network", id="tab-network"):
@@ -1538,6 +1657,17 @@ class SettingsScreen(ModalScreen):
                     with Horizontal(classes="field-row"):
                         yield Label("Force Broadcast", classes="field-label")
                         yield Switch(value=cfg.broadcast, id="sw-broadcast")
+                    with Horizontal(classes="field-row"):
+                        yield Label("OSC Listener", classes="field-label")
+                        yield Switch(value=cfg.osc_enabled, id="sw-osc-enabled")
+                    with Horizontal(classes="field-row"):
+                        yield Label("OSC Port", classes="field-label")
+                        yield Input(
+                            value=str(cfg.osc_port),
+                            id="inp-osc-port",
+                            type="integer",
+                            placeholder="9000",
+                        )
                 with TabPane("Timecode", id="tab-timecode"):
                     with Horizontal(classes="field-row"):
                         yield Label("Frame Rate", classes="field-label")
@@ -1549,7 +1679,23 @@ class SettingsScreen(ModalScreen):
                         )
                     with Horizontal(classes="field-row"):
                         yield Label("Reset TC on Stop", classes="field-label")
-                        yield Switch(value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop")
+                        yield Switch(
+                            value=cfg.reset_tc_on_stop, id="sw-reset-tc-on-stop"
+                        )
+                    with Horizontal(classes="field-row"):
+                        yield Label("Stop on Audio End", classes="field-label")
+                        yield Switch(
+                            value=cfg.stop_on_audio_end, id="sw-stop-on-audio-end"
+                        )
+                    with Horizontal(classes="field-row"):
+                        yield Label("TC Offset (Art-Net)", classes="field-label")
+                        from .artnet_timecode import format_tc_offset
+
+                        yield Input(
+                            value=format_tc_offset(cfg.fps, cfg.tc_offset_frames),
+                            id="inp-tc-offset",
+                            placeholder="+00:00:00:00",
+                        )
                 with TabPane("Tracks", id="tab-tracks"):
                     yield TrackList(
                         self._working_tracks,
@@ -1632,14 +1778,26 @@ class SettingsScreen(ModalScreen):
     def _try_save(self) -> None:
         try:
             fps_raw = self.query_one("#sel-fps", Select).value
+            fps = float(fps_raw) if fps_raw is not Select.BLANK else 25.0
             port_str = self.query_one("#inp-port", Input).value.strip()
+            osc_port_str = self.query_one("#inp-osc-port", Input).value.strip()
+            tc_offset_str = self.query_one("#inp-tc-offset", Input).value.strip()
+            from .artnet_timecode import parse_tc_offset
+
+            tc_offset_frames = (
+                parse_tc_offset(fps, tc_offset_str) if tc_offset_str else 0
+            )
             cfg = dataclasses.replace(
                 self._initial_config,
                 ip=self.query_one("#inp-ip", Input).value.strip(),
                 port=int(port_str) if port_str else 6454,
                 broadcast=self.query_one("#sw-broadcast", Switch).value,
-                fps=float(fps_raw) if fps_raw is not Select.BLANK else 25.0,
+                fps=fps,
                 reset_tc_on_stop=self.query_one("#sw-reset-tc-on-stop", Switch).value,
+                stop_on_audio_end=self.query_one("#sw-stop-on-audio-end", Switch).value,
+                osc_enabled=self.query_one("#sw-osc-enabled", Switch).value,
+                osc_port=int(osc_port_str) if osc_port_str else 9000,
+                tc_offset_frames=tc_offset_frames,
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
@@ -2104,7 +2262,8 @@ class FileBrowserModal(ModalScreen):
     }
     FileBrowserModal > Vertical {
         width: 80;
-        height: 36;
+        height: auto;
+        max-height: 90%;
         background: $surface;
         border: thick $primary;
         padding: 1 2;

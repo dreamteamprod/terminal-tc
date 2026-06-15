@@ -154,6 +154,27 @@ def tc_from_frame_number(fps: float, frame_number: int) -> _LibTimecode:
     return _LibTimecode(_FPS_STR[fps], frames=frame_number + 1)
 
 
+def parse_tc_offset(fps: float, s: str) -> int:
+    """Parse [±]HH:MM:SS:FF to a signed frame count. No sign or '+' = positive."""
+    s = s.strip()
+    sign = -1 if s.startswith("-") else 1
+    clean = s.lstrip("+-").strip()
+    parts = clean.replace(";", ":").split(":")
+    if len(parts) != 4:
+        raise ValueError(f"Expected [±]HH:MM:SS:FF, got {s!r}")
+    h, m, sec, f = (int(p) for p in parts)
+    sep = ";" if fps == 29.97 else ":"
+    tc_str = f"{h:02d}:{m:02d}:{sec:02d}{sep}{f:02d}"
+    return sign * _LibTimecode(_FPS_STR[fps], tc_str).frame_number
+
+
+def format_tc_offset(fps: float, frames: int) -> str:
+    """Format a signed frame count as [±]HH:MM:SS:FF."""
+    sign = "-" if frames < 0 else "+"
+    tc = tc_from_frame_number(fps, abs(frames))
+    return f"{sign}{tc.hrs:02d}:{tc.mins:02d}:{tc.secs:02d}:{tc.frs:02d}"
+
+
 def _detect_marker_format(path: str) -> str:
     """Sniff the first non-empty line to determine marker file format."""
     try:
@@ -355,6 +376,7 @@ class ArtNetTimecodePlayer:
         reset_tc_on_stop: bool = True,
         video_path: Optional[str] = None,
         video_offset: float = 0.0,
+        tc_offset_frames: int = 0,
     ):
 
         self.start_tc = start_tc
@@ -364,6 +386,7 @@ class ArtNetTimecodePlayer:
         self.audio_path = audio_path
         self.broadcast = broadcast
         self.reset_tc_on_stop = reset_tc_on_stop
+        self.tc_offset_frames = tc_offset_frames
 
         self.fps_type = FPS_TYPE_MAP.get(fps, 3)
         self._frame_interval = 1.0 / fps
@@ -396,6 +419,7 @@ class ArtNetTimecodePlayer:
         self._audio_loaded: bool = False
         self._audio_error: str = ""
         self._audio_channels: int = 2
+        self._audio_ended_naturally: bool = False
 
         if audio_path:
             self._load_audio(audio_path)
@@ -467,6 +491,8 @@ class ArtNetTimecodePlayer:
                     stream.write(chunk)  # blocks in C, GIL released during wait
                     pos += chunk_size
                 self._audio_pos = pos
+                if not self._stop_event.is_set():
+                    self._audio_ended_naturally = True
         except Exception as e:
             self._audio_error = f"Audio error: {e}"
 
@@ -516,7 +542,11 @@ class ArtNetTimecodePlayer:
                 self._tc = tc
 
             try:
-                pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
+                out_fn = max(0, local_fn + self.tc_offset_frames)
+                out_tc = tc_from_frame_number(self.fps, out_fn)
+                pkt = build_artimecode(
+                    out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type
+                )
                 self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
                 self.packet_count += 1
             except Exception:
@@ -534,6 +564,8 @@ class ArtNetTimecodePlayer:
                 self._tc = self.start_tc
             self._pause_frame_acc = 0
 
+        self._stop_event.clear()
+        self._audio_ended_naturally = False
         self.state = State.PLAYING
         self.status_msg = "Playing"
         self._play_start_wall = time.perf_counter()  # set now so pause() is always safe
@@ -584,7 +616,7 @@ class ArtNetTimecodePlayer:
         if self._video_ctrl:
             self._video_ctrl.pause()
 
-    def stop(self) -> None:
+    def stop(self, *, reset_tc: bool | None = None) -> None:
         if self.state == State.STOPPED:
             return
         self._stop_event.set()
@@ -594,11 +626,12 @@ class ArtNetTimecodePlayer:
         self._stop_audio()
         if self._video_ctrl:
             self._video_ctrl.stop()
-        if self.reset_tc_on_stop:
+        if reset_tc if reset_tc is not None else self.reset_tc_on_stop:
             with self._tc_lock:
                 self._tc = self.start_tc
             try:
-                tc = self.start_tc
+                out_fn = max(0, self.start_tc.frame_number + self.tc_offset_frames)
+                tc = tc_from_frame_number(self.fps, out_fn)
                 pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
                 self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
                 self.packet_count += 1
@@ -618,7 +651,11 @@ class ArtNetTimecodePlayer:
         with self._tc_lock:
             self._tc = tc
         try:
-            pkt = build_artimecode(tc.hrs, tc.mins, tc.secs, tc.frs, self.fps_type)
+            out_fn = max(0, abs_frame + self.tc_offset_frames)
+            out_tc = tc_from_frame_number(self.fps, out_fn)
+            pkt = build_artimecode(
+                out_tc.hrs, out_tc.mins, out_tc.secs, out_tc.frs, self.fps_type
+            )
             self._sock.sendto(pkt, (self.dest_ip, self.dest_port))
             self.packet_count += 1
         except Exception:
@@ -794,6 +831,12 @@ Examples:
         metavar="FF",
         help="Start timecode frames  (default: 0)",
     )
+    tc_g.add_argument(
+        "--tc-offset",
+        default=argparse.SUPPRESS,
+        metavar="[±]HH:MM:SS:FF",
+        help="Offset applied only to Art-Net output timecode (default: +00:00:00:00)",
+    )
 
     parser.add_argument(
         "--audio",
@@ -854,6 +897,7 @@ def build_player(cfg: AppConfig) -> "ArtNetTimecodePlayer":
         dest_port=cfg.port,
         audio_path=cfg.audio,
         broadcast=cfg.broadcast,
+        tc_offset_frames=cfg.tc_offset_frames,
     )
 
 
@@ -883,6 +927,7 @@ def build_player_from_track(track, cfg: AppConfig) -> "ArtNetTimecodePlayer":
         reset_tc_on_stop=cfg.reset_tc_on_stop,
         video_path=track.video,
         video_offset=track.video_offset,
+        tc_offset_frames=cfg.tc_offset_frames,
     )
 
 
@@ -916,6 +961,17 @@ def main() -> None:
     # objects; asdict() would flatten them back to dicts and lose the type.
     cli_dict = vars(parse_args())
     saved_config = load_config()  # already has TrackConfig objects + migration applied
+
+    # --tc-offset: parse [±]HH:MM:SS:FF to frames using the effective fps
+    if "tc_offset" in cli_dict:
+        fps_for_parse = float(cli_dict.get("fps", saved_config.fps))
+        try:
+            cli_dict["tc_offset_frames"] = parse_tc_offset(
+                fps_for_parse, cli_dict.pop("tc_offset")
+            )
+        except ValueError as exc:
+            print(f"  ✗ --tc-offset: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     # --open-project: swap saved_config before the merge
     if "open_project" in cli_dict:
@@ -1008,6 +1064,24 @@ def main() -> None:
 
     # ── Non-interactive fallback (piped stdin / CI) ────────────────────────────
     if not _is_interactive():
+        osc_srv = None
+        if config.osc_enabled:
+            from .osc_server import OSCServer
+
+            def _noop_track(val):
+                print(f"\n[OSC] /track ignored in non-interactive mode (got {val!r})")
+
+            osc_srv = OSCServer(
+                port=config.osc_port,
+                on_play=player.play,
+                on_pause=player.pause,
+                on_stop=player.stop,
+                on_toggle=player.toggle_play_pause,
+                on_track=_noop_track,
+            )
+            osc_srv.start()
+            print(f"OSC listener active on port {config.osc_port}")
+
         print("Non-interactive mode — auto-playing. Send SIGINT to stop.")
         player.play()
         try:
@@ -1019,6 +1093,8 @@ def main() -> None:
         finally:
             player.stop()
             player.shutdown()
+            if osc_srv:
+                osc_srv.shutdown()
         return
 
     # ── Interactive TUI ────────────────────────────────────────────────────────
