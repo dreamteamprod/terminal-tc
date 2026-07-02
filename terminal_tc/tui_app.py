@@ -1257,7 +1257,22 @@ class TimecodeApp(App[None]):
             else os.path.join(os.path.expanduser("~"), "markers_export.csv")
         )
 
-        def on_path(path: str | None) -> None:
+        track_start_frames = 0
+        track_start_tc_str = ""
+        if track:
+            from .artnet_timecode import make_tc
+            start_tc = make_tc(
+                self._config.fps,
+                track.start_hours, track.start_minutes,
+                track.start_seconds, track.start_frames,
+            )
+            track_start_frames = start_tc.frame_number
+            track_start_tc_str = str(start_tc)
+
+        def on_path(result: tuple | None) -> None:
+            if not result:
+                return
+            path, subtract = result
             if not path:
                 return
             try:
@@ -1265,12 +1280,19 @@ class TimecodeApp(App[None]):
                     writer = csv.writer(f)
                     writer.writerow(["#", "Name", "Start"])
                     for mid, name, tc in self._markers:
+                        if subtract and track_start_frames:
+                            from .artnet_timecode import tc_from_frame_number
+                            frame = max(0, tc.frame_number - track_start_frames)
+                            tc = tc_from_frame_number(self._config.fps, frame)
                         writer.writerow([mid, name, str(tc)])
                 self.notify(f"Exported {len(self._markers)} markers → {path}")
             except OSError as exc:
                 self.notify(f"Export failed: {exc}", severity="error")
 
-        await self.push_screen(ExportMarkersModal(default_path), on_path)
+        await self.push_screen(
+            ExportMarkersModal(default_path, track_start_frames, track_start_tc_str),
+            on_path,
+        )
         self.refresh_bindings()
 
     async def action_generate_markers(self) -> None:
@@ -1569,6 +1591,12 @@ class ExportMarkersModal(ModalScreen):
         padding: 1 0;
     }
     ExportMarkersModal Input { width: 1fr; }
+    ExportMarkersModal #lbl-subtract-hint {
+        color: $text-muted;
+        padding: 0 0 0 1;
+        height: 3;
+        content-align: left middle;
+    }
     ExportMarkersModal #modal-buttons {
         height: 3;
         align: right middle;
@@ -1580,9 +1608,16 @@ class ExportMarkersModal(ModalScreen):
     }
     """
 
-    def __init__(self, default_path: str) -> None:
+    def __init__(
+        self,
+        default_path: str,
+        track_start_frames: int = 0,
+        track_start_tc_str: str = "",
+    ) -> None:
         super().__init__()
         self._default_path = default_path
+        self._track_start_frames = track_start_frames
+        self._track_start_tc_str = track_start_tc_str
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -1590,6 +1625,11 @@ class ExportMarkersModal(ModalScreen):
             with Horizontal(classes="field-row"):
                 yield Label("Output File", classes="field-label")
                 yield Input(value=self._default_path, id="inp-export-path")
+            if self._track_start_frames > 0:
+                with Horizontal(classes="field-row"):
+                    yield Label("Subtract track start", classes="field-label")
+                    yield Switch(value=False, id="sw-subtract-offset")
+                    yield Label(f"({self._track_start_tc_str})", id="lbl-subtract-hint")
             with Horizontal(id="modal-buttons"):
                 yield Button("Export", id="btn-export", variant="primary")
                 yield Button("Cancel", id="btn-cancel")
@@ -1602,7 +1642,12 @@ class ExportMarkersModal(ModalScreen):
             self.dismiss(None)
         elif event.button.id == "btn-export":
             path = self.query_one("#inp-export-path", Input).value.strip()
-            self.dismiss(path or None)
+            subtract = False
+            try:
+                subtract = self.query_one("#sw-subtract-offset", Switch).value
+            except NoMatches:
+                pass
+            self.dismiss((path or None, subtract))
 
 
 # ── Generate markers modal ─────────────────────────────────────────────────────
