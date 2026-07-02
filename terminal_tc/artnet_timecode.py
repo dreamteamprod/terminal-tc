@@ -735,6 +735,79 @@ Examples:
         help="Import a .tcp bundle (you will be prompted for an extract directory), then exit",
     )
 
+    gen = parser.add_argument_group("Marker generation")
+    gen.add_argument(
+        "--generate-markers",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Generate cue markers from BPM/time-signature and write to a file (then exit)",
+    )
+    gen.add_argument(
+        "--bpm",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="BPM",
+        help="Tempo in beats per minute (required with --generate-markers)",
+    )
+    gen.add_argument(
+        "--time-sig",
+        default=argparse.SUPPRESS,
+        metavar="N/D",
+        help="Time signature, e.g. 4/4, 6/8, 3/4  (default: 4/4)",
+    )
+    gen.add_argument(
+        "--beat-unit",
+        default=argparse.SUPPRESS,
+        metavar="NOTE",
+        help="Note value next to the tempo marking on your chart, e.g. 1/4 or 1/4.  (default: 1/4)",
+    )
+    gen.add_argument(
+        "--start-bar",
+        dest="gen_start_bar",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help="First bar to generate markers for, 1-indexed  (default: 1)",
+    )
+    gen.add_argument(
+        "--end-bar",
+        dest="gen_end_bar",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help="Last bar to generate markers for, inclusive (required with --generate-markers)",
+    )
+    gen.add_argument(
+        "--interval",
+        default=argparse.SUPPRESS,
+        metavar="TOKEN",
+        help="Marker spacing: e.g. 1bar, 1/4, 1/8t, 0.5bar  (default: 1bar)",
+    )
+    gen.add_argument(
+        "--marker-name-template",
+        default=argparse.SUPPRESS,
+        metavar="TMPL",
+        help='Name template supporting {bar} and {beat}, e.g. "Bar {bar}"  (default: "Bar {bar}")',
+    )
+    gen.add_argument(
+        "--marker-anchor",
+        default=argparse.SUPPRESS,
+        metavar="HH:MM:SS:FF",
+        help="Timecode where bar 1 beat 1 of this section falls  (default: 00:00:00:00)",
+    )
+    gen.add_argument(
+        "--skip-beats",
+        default=argparse.SUPPRESS,
+        metavar="N[,N…]",
+        help="Comma-separated 1-indexed beat numbers to omit each bar, e.g. 4 or 3,4",
+    )
+    gen.add_argument(
+        "--generate-markers-out",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="Output path for the generated Reaper CSV; omit to print to stdout",
+    )
+
     return parser.parse_args()
 
 
@@ -827,6 +900,78 @@ def main() -> None:
         except ValueError as exc:
             print(f"  ✗ --tc-offset: {exc}", file=sys.stderr)
             sys.exit(1)
+
+    # --generate-markers: pure marker generation, exit before any player/TUI work.
+    # All generator keys are popped so they don't pollute the AppConfig merge below.
+    if "generate_markers" in cli_dict:
+        import csv as _csv
+        from .marker_gen import generate_markers, validate_marker_gen_params
+
+        cli_dict.pop("generate_markers")
+        bpm = cli_dict.pop("bpm", None)
+        time_sig = cli_dict.pop("time_sig", "4/4")
+        beat_unit = cli_dict.pop("beat_unit", "1/4")
+        gen_start_bar = cli_dict.pop("gen_start_bar", 1)
+        gen_end_bar = cli_dict.pop("gen_end_bar", None)
+        interval = cli_dict.pop("interval", "1bar")
+        name_template = cli_dict.pop("marker_name_template", "Bar {bar}")
+        anchor_str = cli_dict.pop("marker_anchor", "00:00:00:00")
+        out_path = cli_dict.pop("generate_markers_out", None)
+        fps = float(cli_dict.get("fps") or saved_config.fps)
+        skip_beats_str = cli_dict.pop("skip_beats", None)
+        skip_beats: list[int] | None = None
+        if skip_beats_str:
+            try:
+                skip_beats = [int(b.strip()) for b in skip_beats_str.split(",")]
+            except ValueError:
+                print("  ✗ --skip-beats: expected comma-separated integers, e.g. 4 or 3,4", file=sys.stderr)
+                sys.exit(1)
+
+        if bpm is None:
+            print("  ✗ --bpm is required with --generate-markers", file=sys.stderr)
+            sys.exit(1)
+        if gen_end_bar is None:
+            print("  ✗ --end-bar is required with --generate-markers", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            anchor_frames = parse_tc_offset(fps, anchor_str)
+            if anchor_frames < 0:
+                raise ValueError("anchor cannot be negative")
+        except ValueError as exc:
+            print(f"  ✗ --marker-anchor: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        errs = validate_marker_gen_params(bpm, time_sig, gen_start_bar, gen_end_bar, interval, fps, beat_unit)
+        if errs:
+            for e in errs:
+                print(f"  ✗ {e}", file=sys.stderr)
+            sys.exit(1)
+
+        markers = generate_markers(
+            bpm=bpm, time_sig=time_sig, start_bar=gen_start_bar, end_bar=gen_end_bar,
+            interval=interval, fps=fps, beat_unit=beat_unit,
+            anchor_frames=anchor_frames, name_template=name_template,
+            skip_beats=skip_beats,
+        )
+
+        def _write_csv(f):
+            writer = _csv.writer(f)
+            writer.writerow(["#", "Name", "Start"])
+            for mid, name, tc in markers:
+                writer.writerow([mid, name, str(tc)])
+
+        if out_path:
+            with open(out_path, "w", newline="", encoding="utf-8") as f:
+                _write_csv(f)
+            print(f"Generated {len(markers)} markers → {out_path}")
+        else:
+            import io
+            buf = io.StringIO()
+            _write_csv(buf)
+            print(buf.getvalue(), end="")
+
+        return
 
     # --open-project: swap saved_config before the merge
     if "open_project" in cli_dict:

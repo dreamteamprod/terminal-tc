@@ -643,6 +643,11 @@ class TimecodeCommands(Provider):
             "Save current markers to a CSV file",
             "action_export_markers",
         ),
+        (
+            "Generate Markers",
+            "Generate cue markers from BPM and time signature",
+            "action_generate_markers",
+        ),
         ("Settings", "Configure network and timecode", "action_open_settings"),
         ("Quit", "Exit the application", "action_quit"),
     ]
@@ -691,6 +696,7 @@ class TimecodeApp(App[None]):
         Binding("e", "edit_track", "Edit Track"),
         Binding("d", "delete_track", "Del Track"),
         Binding("x", "export_markers", "Export"),
+        Binding("g", "generate_markers", "Gen. markers"),
         Binding("ctrl+comma", "open_settings", "Settings"),
         Binding("p", "open_projects", "Projects"),
         Binding("ctrl+s", "save_project", "Save Project", show=False),
@@ -1267,6 +1273,48 @@ class TimecodeApp(App[None]):
         await self.push_screen(ExportMarkersModal(default_path), on_path)
         self.refresh_bindings()
 
+    async def action_generate_markers(self) -> None:
+        async def on_result(result: tuple | None) -> None:
+            if result is None:
+                return
+            new_markers, mode = result
+            if mode == "append" and self._markers:
+                combined = list(self._markers) + new_markers
+                combined.sort(key=lambda t: t[2].frame_number)
+                combined = [
+                    (f"{i + 1:04d}", name, tc)
+                    for i, (_, name, tc) in enumerate(combined)
+                ]
+                markers = combined
+            else:
+                markers = new_markers
+            self._markers = markers
+            self.query_one("#waveform", WaveformWidget).reload(self._player, markers)
+            self.query_one("#markers", MarkerList).set_markers(markers)
+            panel = self.query_one("#marker-panel")
+            if markers:
+                panel.add_class("visible")
+            else:
+                panel.remove_class("visible")
+            self.notify(
+                f"{len(new_markers)} markers generated ({len(markers)} total — press x to export)"
+            )
+
+        track = self._active_track()
+        if track:
+            sep = ";" if self._config.fps == 29.97 else ":"
+            default_anchor = (
+                f"{track.start_hours:02d}:{track.start_minutes:02d}:"
+                f"{track.start_seconds:02d}{sep}{track.start_frames:02d}"
+            )
+        else:
+            default_anchor = "00:00:00:00"
+
+        await self.push_screen(
+            GenerateMarkersModal(self._config.fps, default_anchor=default_anchor), on_result
+        )
+        self.refresh_bindings()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-play":
             self._player.toggle_play_pause()
@@ -1555,6 +1603,212 @@ class ExportMarkersModal(ModalScreen):
         elif event.button.id == "btn-export":
             path = self.query_one("#inp-export-path", Input).value.strip()
             self.dismiss(path or None)
+
+
+# ── Generate markers modal ─────────────────────────────────────────────────────
+
+
+class GenerateMarkersModal(ModalScreen):
+    """Modal for generating cue markers from BPM and time signature."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    DEFAULT_CSS = """
+    GenerateMarkersModal {
+        align: center middle;
+    }
+    GenerateMarkersModal > VerticalScroll {
+        width: 74;
+        height: auto;
+        max-height: 90%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    GenerateMarkersModal #modal-title {
+        text-style: bold;
+        height: 2;
+        padding: 0 0 1 0;
+    }
+    GenerateMarkersModal .field-row {
+        height: 3;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    GenerateMarkersModal .field-label {
+        width: 26;
+        height: 3;
+        content-align: left middle;
+        padding: 1 0;
+    }
+    GenerateMarkersModal Input { width: 1fr; }
+    GenerateMarkersModal Select { width: 1fr; }
+    GenerateMarkersModal #validation-error {
+        color: $error;
+        height: auto;
+        padding: 0 0 1 0;
+        display: none;
+    }
+    GenerateMarkersModal #validation-error.visible { display: block; }
+    GenerateMarkersModal #modal-buttons {
+        height: 3;
+        align: right middle;
+        margin: 1 0 0 0;
+    }
+    GenerateMarkersModal #modal-buttons Button {
+        margin: 0 0 0 1;
+        min-width: 10;
+    }
+    """
+
+    def __init__(self, fps: float, default_anchor: str = "00:00:00:00") -> None:
+        super().__init__()
+        self._fps = fps
+        self._default_anchor = default_anchor
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("♩  Generate Markers from BPM", id="modal-title")
+            with Horizontal(classes="field-row"):
+                yield Label("BPM", classes="field-label")
+                yield Input(placeholder="e.g. 110", id="inp-bpm")
+            with Horizontal(classes="field-row"):
+                yield Label("Time signature", classes="field-label")
+                yield Input(value="4/4", placeholder="e.g. 4/4, 6/8, 3/4", id="inp-time-sig")
+            with Horizontal(classes="field-row"):
+                yield Label("Beat unit", classes="field-label")
+                yield Input(
+                    value="1/4",
+                    placeholder="Note value next to tempo marking (1/4, 1/4., …)",
+                    id="inp-beat-unit",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Start bar", classes="field-label")
+                yield Input(value="1", placeholder="1-indexed", id="inp-start-bar")
+            with Horizontal(classes="field-row"):
+                yield Label("End bar (inclusive)", classes="field-label")
+                yield Input(placeholder="e.g. 32", id="inp-end-bar")
+            with Horizontal(classes="field-row"):
+                yield Label("Interval", classes="field-label")
+                yield Input(
+                    value="1bar",
+                    placeholder="e.g. 1bar, 1/4, 1/8t, 0.5bar",
+                    id="inp-interval",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Skip beats", classes="field-label")
+                yield Input(
+                    placeholder="Beat numbers to omit each bar, e.g. 4  or  3,4",
+                    id="inp-skip-beats",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Name template", classes="field-label")
+                yield Input(
+                    value="Bar {bar}",
+                    placeholder="{bar} and {beat} are available",
+                    id="inp-name-template",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Bar 1 starts at", classes="field-label")
+                yield Input(
+                    value=self._default_anchor,
+                    placeholder="HH:MM:SS:FF — track start TC is pre-filled",
+                    id="inp-anchor",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Mode", classes="field-label")
+                yield Select(
+                    [("Append to existing markers", "append"), ("Replace all markers", "replace")],
+                    value="append",
+                    id="sel-mode",
+                )
+            yield Static("", id="validation-error")
+            with Horizontal(id="modal-buttons"):
+                yield Button("Generate", id="btn-generate", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "btn-generate":
+            return
+
+        from .marker_gen import generate_markers, validate_marker_gen_params
+        from .artnet_timecode import parse_tc_offset
+
+        bpm_str = self.query_one("#inp-bpm", Input).value.strip()
+        time_sig = self.query_one("#inp-time-sig", Input).value.strip()
+        beat_unit = self.query_one("#inp-beat-unit", Input).value.strip()
+        start_bar_str = self.query_one("#inp-start-bar", Input).value.strip()
+        end_bar_str = self.query_one("#inp-end-bar", Input).value.strip()
+        interval = self.query_one("#inp-interval", Input).value.strip()
+        skip_beats_str = self.query_one("#inp-skip-beats", Input).value.strip()
+        name_template = self.query_one("#inp-name-template", Input).value.strip()
+        anchor_str = self.query_one("#inp-anchor", Input).value.strip() or "00:00:00:00"
+        mode = self.query_one("#sel-mode", Select).value
+
+        errs: list[str] = []
+
+        try:
+            bpm = float(bpm_str)
+        except ValueError:
+            errs.append("BPM must be a number")
+            bpm = 1.0
+
+        try:
+            start_bar = int(start_bar_str)
+        except ValueError:
+            errs.append("Start bar must be an integer")
+            start_bar = 1
+
+        try:
+            end_bar = int(end_bar_str)
+        except ValueError:
+            errs.append("End bar must be an integer")
+            end_bar = 1
+
+        skip_beats: list[int] | None = None
+        if skip_beats_str:
+            try:
+                skip_beats = [int(b.strip()) for b in skip_beats_str.split(",")]
+            except ValueError:
+                errs.append("Skip beats: enter comma-separated beat numbers, e.g. 4 or 3,4")
+
+        try:
+            anchor_frames = parse_tc_offset(self._fps, anchor_str)
+            if anchor_frames < 0:
+                raise ValueError("anchor cannot be negative")
+        except ValueError as exc:
+            errs.append(f"Anchor: {exc}")
+            anchor_frames = 0
+
+        if not errs:
+            errs = validate_marker_gen_params(bpm, time_sig, start_bar, end_bar, interval, self._fps, beat_unit)
+
+        err_widget = self.query_one("#validation-error", Static)
+        if errs:
+            err_widget.update("\n".join(errs))
+            err_widget.add_class("visible")
+            return
+
+        err_widget.remove_class("visible")
+        markers = generate_markers(
+            bpm=bpm,
+            time_sig=time_sig,
+            start_bar=start_bar,
+            end_bar=end_bar,
+            interval=interval,
+            fps=self._fps,
+            beat_unit=beat_unit,
+            anchor_frames=anchor_frames,
+            name_template=name_template,
+            skip_beats=skip_beats,
+        )
+        self.dismiss((markers, mode))
 
 
 # ── Settings modal ─────────────────────────────────────────────────────────────

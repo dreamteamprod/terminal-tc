@@ -19,6 +19,9 @@ dependencies = [
     "python-osc>=1.8",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.scripts]
 artnet-timecode = "terminal_tc.artnet_timecode:main"
 
