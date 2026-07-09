@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from rich.text import Text
+from timecode import Timecode
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -142,8 +143,14 @@ class MarkerList(Widget):
             sel = i == self.cursor
             arrow = "▶ " if sel else "  "
             style = "bold green" if sel else "dim"
+            if i == 0:
+                delta_str = "──────────"
+            else:
+                prev_tc = self._markers[i - 1][2]
+                delta_frames = tc.frame_number - prev_tc.frame_number
+                delta_str = str(Timecode(framerate=tc.framerate, frames=delta_frames + 1))
             lines.append(
-                Text(f"{arrow}{mid[:4]:<4}  {name[:20]:<20}  {tc}", style=style)
+                Text(f"{arrow}{mid[:4]:<4}  {name[:20]:<20}  {str(tc):<11}  {delta_str}", style=style)
             )
         while len(lines) < h:
             lines.append(Text(""))
@@ -754,6 +761,12 @@ class TimecodeApp(App[None]):
         color: $text 60%;
         height: 2;
     }
+
+    #markers-col-hdr {
+        color: $text 50%;
+        text-style: bold;
+        padding: 0 1;
+    }
     """
 
     def __init__(
@@ -793,6 +806,7 @@ class TimecodeApp(App[None]):
                     yield Button("■  Stop", id="btn-stop", variant="error")
             with Vertical(id="marker-panel"):
                 yield Label("── MARKERS ────────────────────────", id="markers-hdr")
+                yield Static("  ID    Name                  Timecode     Δ TC", id="markers-col-hdr")
                 yield MarkerList(self._markers, id="markers")
         yield Footer()
 
@@ -805,10 +819,13 @@ class TimecodeApp(App[None]):
         p = self._player
         c = self._config
         track = self._active_track()
-        dest = c.ip
-        if c.broadcast or c.ip.endswith(".255"):
-            dest += "  (broadcast)"
-        dest += f":{c.port}"
+        if not c.ip:
+            dest = "Artnet Disabled"
+        else:
+            dest = c.ip
+            if c.broadcast or c.ip.endswith(".255"):
+                dest += "  (broadcast)"
+            dest += f":{c.port}"
         fps_label = _FPS_LABEL.get(c.fps, f"{c.fps} fps")
         audio = self._audio_status()
         name = track.name if track else "—"
