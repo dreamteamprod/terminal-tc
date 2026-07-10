@@ -122,6 +122,42 @@ def seconds_per_beat_unit(bpm: float) -> Fraction:
     return Fraction(60) / Fraction(bpm).limit_denominator(100_000)
 
 
+def parse_bar_spec(spec: str) -> list[tuple[int, int]]:
+    """Parse a comma-separated bar spec into inclusive (start_bar, end_bar) tuples.
+
+    Grammar: spec := token ("," token)* ; token := "N" | "N-M" (N, M ≥ 1).
+    "N" becomes (N, N). Tokens are returned in the order given (not sorted or deduped).
+    """
+    tokens = [t.strip() for t in spec.strip().split(",")]
+    if not spec.strip() or any(not t for t in tokens):
+        raise ValueError(f"invalid bar spec {spec!r}: empty token")
+
+    ranges: list[tuple[int, int]] = []
+    for tok in tokens:
+        if "-" in tok:
+            parts = tok.split("-")
+            if len(parts) != 2:
+                raise ValueError(f"invalid bar range {tok!r}: expected 'N-M'")
+            try:
+                start, end = int(parts[0].strip()), int(parts[1].strip())
+            except ValueError:
+                raise ValueError(f"non-integer bar range {tok!r}")
+            if start < 1:
+                raise ValueError(f"bar numbers must be ≥ 1, got {start}")
+            if end < start:
+                raise ValueError(f"range end must be ≥ start in {tok!r}")
+            ranges.append((start, end))
+        else:
+            try:
+                n = int(tok)
+            except ValueError:
+                raise ValueError(f"non-integer bar {tok!r}")
+            if n < 1:
+                raise ValueError(f"bar numbers must be ≥ 1, got {n}")
+            ranges.append((n, n))
+    return ranges
+
+
 def generate_markers(
     bpm: float,
     time_sig: str,
@@ -196,16 +232,55 @@ def generate_markers(
     return markers
 
 
-def validate_marker_gen_params(
+def generate_markers_from_bar_spec(
     bpm: float,
     time_sig: str,
-    start_bar: int,
-    end_bar: int,
+    bar_spec: str,
+    interval: str,
+    fps: float,
+    beat_unit: str = "1/4",
+    anchor_frames: int = 0,
+    name_template: str = "Bar {bar}",
+    skip_beats: list[int] | None = None,
+) -> list[tuple[str, str, _LibTimecode]]:
+    """Generate markers across one or more bar ranges parsed from bar_spec.
+
+    Calls generate_markers() once per (start_bar, end_bar) sub-range parsed by
+    parse_bar_spec(), reusing its exact-Fraction arithmetic unchanged. Results
+    are concatenated, sorted by frame number, and ids renumbered 0001.. —
+    overlapping ranges are not deduplicated.
+    """
+    ranges = parse_bar_spec(bar_spec)
+    all_markers: list[tuple[str, str, _LibTimecode]] = []
+    for start_bar, end_bar in ranges:
+        all_markers.extend(
+            generate_markers(
+                bpm=bpm,
+                time_sig=time_sig,
+                start_bar=start_bar,
+                end_bar=end_bar,
+                interval=interval,
+                fps=fps,
+                beat_unit=beat_unit,
+                anchor_frames=anchor_frames,
+                name_template=name_template,
+                skip_beats=skip_beats,
+            )
+        )
+    all_markers.sort(key=lambda m: m[2].frame_number)
+    return [
+        (f"{i + 1:04d}", name, tc) for i, (_, name, tc) in enumerate(all_markers)
+    ]
+
+
+def _validate_common_params(
+    bpm: float,
+    time_sig: str,
     interval: str,
     fps: float,
     beat_unit: str = "1/4",
 ) -> list[str]:
-    """Return human-readable error strings; empty list = valid."""
+    """Shared bpm/fps/time_sig/beat_unit/interval checks used by both validators."""
     errs: list[str] = []
 
     if not isinstance(bpm, (int, float)) or bpm <= 0:
@@ -213,14 +288,6 @@ def validate_marker_gen_params(
 
     if fps not in SUPPORTED_FPS:
         errs.append(f"Frame rate must be one of {SUPPORTED_FPS}")
-
-    if not isinstance(start_bar, int) or start_bar < 1:
-        errs.append("Start bar must be an integer ≥ 1")
-
-    if not isinstance(end_bar, int) or end_bar < 1:
-        errs.append("End bar must be an integer ≥ 1")
-    elif isinstance(start_bar, int) and start_bar >= 1 and end_bar < start_bar:
-        errs.append("End bar must be ≥ start bar")
 
     try:
         parse_time_signature(time_sig)
@@ -241,5 +308,50 @@ def validate_marker_gen_params(
             errs.append("Interval must be a positive duration")
     except ValueError as exc:
         errs.append(f"Invalid interval: {exc}")
+
+    return errs
+
+
+def validate_marker_gen_params(
+    bpm: float,
+    time_sig: str,
+    start_bar: int,
+    end_bar: int,
+    interval: str,
+    fps: float,
+    beat_unit: str = "1/4",
+) -> list[str]:
+    """Return human-readable error strings; empty list = valid."""
+    errs: list[str] = []
+
+    if not isinstance(start_bar, int) or start_bar < 1:
+        errs.append("Start bar must be an integer ≥ 1")
+
+    if not isinstance(end_bar, int) or end_bar < 1:
+        errs.append("End bar must be an integer ≥ 1")
+    elif isinstance(start_bar, int) and start_bar >= 1 and end_bar < start_bar:
+        errs.append("End bar must be ≥ start bar")
+
+    errs.extend(_validate_common_params(bpm, time_sig, interval, fps, beat_unit))
+    return errs
+
+
+def validate_bar_spec_params(
+    bpm: float,
+    time_sig: str,
+    bar_spec: str,
+    interval: str,
+    fps: float,
+    beat_unit: str = "1/4",
+) -> list[str]:
+    """Return human-readable error strings; empty list = valid."""
+    errs = _validate_common_params(bpm, time_sig, interval, fps, beat_unit)
+
+    try:
+        ranges = parse_bar_spec(bar_spec)
+        if not ranges:
+            errs.append("Bar spec must contain at least one bar or range")
+    except ValueError as exc:
+        errs.append(f"Invalid bar spec: {exc}")
 
     return errs

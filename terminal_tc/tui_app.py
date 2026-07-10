@@ -69,6 +69,13 @@ _FPS_LABEL = {
 }
 
 
+def _fmt_optional_bpm(value: float | None) -> str:
+    """Format an optional BPM for Input prefill — "" if unset, no trailing .0 if whole."""
+    if value is None:
+        return ""
+    return str(int(value)) if value == int(value) else str(value)
+
+
 class StateDisplay(Static):
     """Shows the current player state, colour-coded."""
 
@@ -1346,11 +1353,24 @@ class TimecodeApp(App[None]):
                 f"{track.start_hours:02d}:{track.start_minutes:02d}:"
                 f"{track.start_seconds:02d}{sep}{track.start_frames:02d}"
             )
+            default_bpm = track.bpm
+            default_time_sig = track.time_sig
+            default_beat_unit = track.beat_unit
         else:
             default_anchor = "00:00:00:00"
+            default_bpm = None
+            default_time_sig = None
+            default_beat_unit = None
 
         await self.push_screen(
-            GenerateMarkersModal(self._config.fps, default_anchor=default_anchor), on_result
+            GenerateMarkersModal(
+                self._config.fps,
+                default_anchor=default_anchor,
+                default_bpm=default_bpm,
+                default_time_sig=default_time_sig,
+                default_beat_unit=default_beat_unit,
+            ),
+            on_result,
         )
         self.refresh_bindings()
 
@@ -1506,6 +1526,27 @@ class TrackEditModal(ModalScreen):
                     id="sel-stop-on-audio-end",
                     allow_blank=False,
                 )
+            with Horizontal(classes="field-row"):
+                yield Label("BPM", classes="field-label")
+                yield Input(
+                    value=_fmt_optional_bpm(t.bpm),
+                    id="inp-track-bpm",
+                    placeholder="Optional — leave blank for no override",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Time signature", classes="field-label")
+                yield Input(
+                    value=t.time_sig or "",
+                    id="inp-track-time-sig",
+                    placeholder="Optional, e.g. 4/4 — leave blank for no override",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Beat unit", classes="field-label")
+                yield Input(
+                    value=t.beat_unit or "",
+                    id="inp-track-beat-unit",
+                    placeholder="Optional, e.g. 1/4 — leave blank for no override",
+                )
             yield Static("", id="validation-error")
             with Horizontal(id="modal-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
@@ -1543,6 +1584,9 @@ class TrackEditModal(ModalScreen):
             abs_raw = self.query_one("#sel-markers-absolute", Select).value
             sae_raw = self.query_one("#sel-stop-on-audio-end", Select).value
             sae_map = {"true": True, "false": False, "inherit": None}
+            bpm_str = self.query_one("#inp-track-bpm", Input).value.strip()
+            time_sig_str = self.query_one("#inp-track-time-sig", Input).value.strip()
+            beat_unit_str = self.query_one("#inp-track-beat-unit", Input).value.strip()
             track = TrackConfig(
                 name=self.query_one("#inp-name", Input).value.strip(),
                 start_hours=int(self.query_one("#inp-hours", Input).value or "0"),
@@ -1554,12 +1598,29 @@ class TrackEditModal(ModalScreen):
                 marker_format=str(fmt_raw) if fmt_raw is not Select.BLANK else "auto",
                 markers_absolute=abs_raw != "relative",
                 stop_on_audio_end=sae_map.get(str(sae_raw), None),
+                bpm=float(bpm_str) if bpm_str else None,
+                time_sig=time_sig_str or None,
+                beat_unit=beat_unit_str or None,
             )
         except (ValueError, TypeError) as exc:
             self._show_error(f"Invalid value: {exc}")
             return
 
+        from .marker_gen import parse_note_value, parse_time_signature
+
         errs = validate_track_config(track, self._fps)
+        if track.time_sig is not None:
+            try:
+                parse_time_signature(track.time_sig)
+            except ValueError as exc:
+                errs.append(f"Invalid time signature: {exc}")
+        if track.beat_unit is not None:
+            try:
+                bu = parse_note_value(track.beat_unit)
+                if bu <= 0:
+                    errs.append("Beat unit must be a positive note value")
+            except ValueError as exc:
+                errs.append(f"Invalid beat unit: {exc}")
         if errs:
             self._show_error("\n".join(f"✗  {e}" for e in errs))
             return
@@ -1723,33 +1784,51 @@ class GenerateMarkersModal(ModalScreen):
     }
     """
 
-    def __init__(self, fps: float, default_anchor: str = "00:00:00:00") -> None:
+    def __init__(
+        self,
+        fps: float,
+        default_anchor: str = "00:00:00:00",
+        default_bpm: float | None = None,
+        default_time_sig: str | None = None,
+        default_beat_unit: str | None = None,
+    ) -> None:
         super().__init__()
         self._fps = fps
         self._default_anchor = default_anchor
+        self._default_bpm = default_bpm
+        self._default_time_sig = default_time_sig
+        self._default_beat_unit = default_beat_unit
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Label("♩  Generate Markers from BPM", id="modal-title")
             with Horizontal(classes="field-row"):
                 yield Label("BPM", classes="field-label")
-                yield Input(placeholder="e.g. 110", id="inp-bpm")
+                yield Input(
+                    value=_fmt_optional_bpm(self._default_bpm),
+                    placeholder="e.g. 110",
+                    id="inp-bpm",
+                )
             with Horizontal(classes="field-row"):
                 yield Label("Time signature", classes="field-label")
-                yield Input(value="4/4", placeholder="e.g. 4/4, 6/8, 3/4", id="inp-time-sig")
+                yield Input(
+                    value=self._default_time_sig or "4/4",
+                    placeholder="e.g. 4/4, 6/8, 3/4",
+                    id="inp-time-sig",
+                )
             with Horizontal(classes="field-row"):
                 yield Label("Beat unit", classes="field-label")
                 yield Input(
-                    value="1/4",
+                    value=self._default_beat_unit or "1/4",
                     placeholder="Note value next to tempo marking (1/4, 1/4., …)",
                     id="inp-beat-unit",
                 )
             with Horizontal(classes="field-row"):
-                yield Label("Start bar", classes="field-label")
-                yield Input(value="1", placeholder="1-indexed", id="inp-start-bar")
-            with Horizontal(classes="field-row"):
-                yield Label("End bar (inclusive)", classes="field-label")
-                yield Input(placeholder="e.g. 32", id="inp-end-bar")
+                yield Label("Bars", classes="field-label")
+                yield Input(
+                    placeholder="e.g. 1-32 or 1,5,9-12",
+                    id="inp-bars",
+                )
             with Horizontal(classes="field-row"):
                 yield Label("Interval", classes="field-label")
                 yield Input(
@@ -1799,14 +1878,13 @@ class GenerateMarkersModal(ModalScreen):
         if event.button.id != "btn-generate":
             return
 
-        from .marker_gen import generate_markers, validate_marker_gen_params
+        from .marker_gen import generate_markers_from_bar_spec, validate_bar_spec_params
         from .artnet_timecode import parse_tc_offset
 
         bpm_str = self.query_one("#inp-bpm", Input).value.strip()
         time_sig = self.query_one("#inp-time-sig", Input).value.strip()
         beat_unit = self.query_one("#inp-beat-unit", Input).value.strip()
-        start_bar_str = self.query_one("#inp-start-bar", Input).value.strip()
-        end_bar_str = self.query_one("#inp-end-bar", Input).value.strip()
+        bars_str = self.query_one("#inp-bars", Input).value.strip()
         interval = self.query_one("#inp-interval", Input).value.strip()
         skip_beats_str = self.query_one("#inp-skip-beats", Input).value.strip()
         name_template = self.query_one("#inp-name-template", Input).value.strip()
@@ -1820,18 +1898,6 @@ class GenerateMarkersModal(ModalScreen):
         except ValueError:
             errs.append("BPM must be a number")
             bpm = 1.0
-
-        try:
-            start_bar = int(start_bar_str)
-        except ValueError:
-            errs.append("Start bar must be an integer")
-            start_bar = 1
-
-        try:
-            end_bar = int(end_bar_str)
-        except ValueError:
-            errs.append("End bar must be an integer")
-            end_bar = 1
 
         skip_beats: list[int] | None = None
         if skip_beats_str:
@@ -1849,7 +1915,7 @@ class GenerateMarkersModal(ModalScreen):
             anchor_frames = 0
 
         if not errs:
-            errs = validate_marker_gen_params(bpm, time_sig, start_bar, end_bar, interval, self._fps, beat_unit)
+            errs = validate_bar_spec_params(bpm, time_sig, bars_str, interval, self._fps, beat_unit)
 
         err_widget = self.query_one("#validation-error", Static)
         if errs:
@@ -1858,11 +1924,10 @@ class GenerateMarkersModal(ModalScreen):
             return
 
         err_widget.remove_class("visible")
-        markers = generate_markers(
+        markers = generate_markers_from_bar_spec(
             bpm=bpm,
             time_sig=time_sig,
-            start_bar=start_bar,
-            end_bar=end_bar,
+            bar_spec=bars_str,
             interval=interval,
             fps=self._fps,
             beat_unit=beat_unit,

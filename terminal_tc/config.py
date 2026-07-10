@@ -64,6 +64,9 @@ class TrackConfig:
     start_frames: int = 0
     markers_absolute: bool = True
     stop_on_audio_end: Optional[bool] = None  # None = inherit global default
+    bpm: Optional[float] = None
+    time_sig: Optional[str] = None
+    beat_unit: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -182,6 +185,8 @@ def validate_track_config(
     max_frames = round(fps) - 1
     if not (0 <= track.start_frames <= max_frames):
         errs.append(f"Start frames must be 0–{max_frames} for {fps} fps")
+    if track.bpm is not None and track.bpm <= 0:
+        errs.append("BPM must be a positive number")
     if check_files:
         if track.audio and not os.path.isfile(track.audio):
             errs.append(f"Audio file not found: {track.audio}")

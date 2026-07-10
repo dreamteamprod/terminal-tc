@@ -6,10 +6,13 @@ from fractions import Fraction
 from terminal_tc.marker_gen import (
     bar_duration_whole_notes,
     generate_markers,
+    generate_markers_from_bar_spec,
+    parse_bar_spec,
     parse_interval,
     parse_note_value,
     parse_time_signature,
     seconds_per_beat_unit,
+    validate_bar_spec_params,
     validate_marker_gen_params,
 )
 
@@ -360,3 +363,148 @@ def test_validate_bad_time_sig():
 def test_validate_bad_interval():
     errs = validate_marker_gen_params(120, "4/4", 1, 8, "notaninterval", 25)
     assert any("interval" in e.lower() for e in errs)
+
+
+# ── parse_bar_spec ────────────────────────────────────────────────────────────
+
+
+def test_bar_spec_single_range():
+    assert parse_bar_spec("1-8") == [(1, 8)]
+
+
+def test_bar_spec_single_bar():
+    assert parse_bar_spec("5") == [(5, 5)]
+
+
+def test_bar_spec_mixed():
+    assert parse_bar_spec("1-8,12,20-24") == [(1, 8), (12, 12), (20, 24)]
+
+
+def test_bar_spec_whitespace_tolerant():
+    assert parse_bar_spec(" 1 - 8 , 12 ") == [(1, 8), (12, 12)]
+
+
+def test_bar_spec_preserves_order_no_dedup():
+    assert parse_bar_spec("12,1-2") == [(12, 12), (1, 2)]
+
+
+def test_bar_spec_empty_string():
+    with pytest.raises(ValueError):
+        parse_bar_spec("")
+
+
+def test_bar_spec_trailing_comma():
+    with pytest.raises(ValueError):
+        parse_bar_spec("1-8,")
+
+
+def test_bar_spec_non_integer():
+    with pytest.raises(ValueError):
+        parse_bar_spec("abc")
+
+
+def test_bar_spec_non_integer_in_range():
+    with pytest.raises(ValueError):
+        parse_bar_spec("1-abc")
+
+
+def test_bar_spec_end_before_start():
+    with pytest.raises(ValueError):
+        parse_bar_spec("8-1")
+
+
+def test_bar_spec_zero_bar():
+    with pytest.raises(ValueError):
+        parse_bar_spec("0-5")
+
+
+def test_bar_spec_bad_range_format():
+    with pytest.raises(ValueError):
+        parse_bar_spec("1-2-3")
+
+
+# ── generate_markers_from_bar_spec ───────────────────────────────────────────
+
+
+def test_bar_spec_generation_matches_single_range():
+    # bar_spec="1-4" must produce exactly what generate_markers(start_bar=1, end_bar=4) does
+    a = generate_markers(
+        bpm=120, time_sig="4/4", start_bar=1, end_bar=4, interval="1bar", fps=25,
+    )
+    b = generate_markers_from_bar_spec(
+        bpm=120, time_sig="4/4", bar_spec="1-4", interval="1bar", fps=25,
+    )
+    assert a == b
+
+
+def test_bar_spec_generation_multi_range():
+    # 120 BPM, 4/4, 25fps, interval=1bar → 50 frames/bar
+    markers = generate_markers_from_bar_spec(
+        bpm=120, time_sig="4/4", bar_spec="1-2,5", interval="1bar", fps=25,
+    )
+    names = [m[1] for m in markers]
+    frames = [m[2].frame_number for m in markers]
+    assert names == ["Bar 1", "Bar 2", "Bar 5"]
+    assert frames == [0, 50, 200]
+
+
+def test_bar_spec_generation_sorts_out_of_order_ranges():
+    # bar_spec lists bar 5 before bars 1-2 — output must still be frame-sorted
+    markers = generate_markers_from_bar_spec(
+        bpm=120, time_sig="4/4", bar_spec="5,1-2", interval="1bar", fps=25,
+    )
+    assert [m[1] for m in markers] == ["Bar 1", "Bar 2", "Bar 5"]
+
+
+def test_bar_spec_generation_renumbers_ids_sequentially():
+    markers = generate_markers_from_bar_spec(
+        bpm=120, time_sig="4/4", bar_spec="5,1-2", interval="1bar", fps=25,
+    )
+    for i, (mid, _, _) in enumerate(markers):
+        assert mid == f"{i + 1:04d}"
+
+
+def test_bar_spec_generation_overlapping_ranges_not_deduped():
+    # Bar 2 appears in both sub-ranges — expect it twice, no deduplication
+    markers = generate_markers_from_bar_spec(
+        bpm=120, time_sig="4/4", bar_spec="1-2,2-3", interval="1bar", fps=25,
+    )
+    names = [m[1] for m in markers]
+    assert names == ["Bar 1", "Bar 2", "Bar 2", "Bar 3"]
+
+
+# ── validate_bar_spec_params ──────────────────────────────────────────────────
+
+
+def test_validate_bar_spec_all_valid():
+    assert validate_bar_spec_params(120, "4/4", "1-8,12", "1bar", 25) == []
+
+
+def test_validate_bar_spec_bad_bpm():
+    errs = validate_bar_spec_params(-5, "4/4", "1-8", "1bar", 25)
+    assert any("BPM" in e for e in errs)
+
+
+def test_validate_bar_spec_bad_fps():
+    errs = validate_bar_spec_params(120, "4/4", "1-8", "1bar", 23)
+    assert any("Frame rate" in e for e in errs)
+
+
+def test_validate_bar_spec_bad_time_sig():
+    errs = validate_bar_spec_params(120, "4/6", "1-8", "1bar", 25)
+    assert any("time signature" in e.lower() for e in errs)
+
+
+def test_validate_bar_spec_bad_interval():
+    errs = validate_bar_spec_params(120, "4/4", "1-8", "notaninterval", 25)
+    assert any("interval" in e.lower() for e in errs)
+
+
+def test_validate_bar_spec_empty():
+    errs = validate_bar_spec_params(120, "4/4", "", "1bar", 25)
+    assert any("bar spec" in e.lower() for e in errs)
+
+
+def test_validate_bar_spec_non_integer():
+    errs = validate_bar_spec_params(120, "4/4", "1-8,abc", "1bar", 25)
+    assert any("bar spec" in e.lower() for e in errs)
