@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
-    "textual>=0.47",
+    "textual>=8.2.8",
     "sounddevice>=0.5.6",
     "soundfile>=0.12",
     "numpy>=1.24",
